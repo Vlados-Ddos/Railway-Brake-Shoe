@@ -1,0 +1,10 @@
+{
+  "Id": "RailwayBrakeShoe",
+  "DisplayName": "Railway Brake Shoe",
+  "Author": "7Vlad7",
+  "Version": "1.0.0",
+  "AssemblyName": "RailwayBrakeShoe.dll",
+  "EntryMethod": "RailwayBrakeShoe.Main.Load",
+  "Requirements": [ "custom_item_mod" ],
+  "LoadAfter": [ "custom_item_mod", "ShopRework" ]
+}

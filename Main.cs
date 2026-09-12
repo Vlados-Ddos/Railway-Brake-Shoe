@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
+using System.Reflection.Emit;
 using HarmonyLib;
 using Newtonsoft.Json.Linq;
 using UnityEngine;
@@ -15,7 +16,7 @@ namespace RailwayBrakeShoe
         public float DryFriction = 0.32f;
         public float WetFrictionMultiplier = 0.55f;
         public float MaximumBrakeForce = 120000f;
-        public float BreakawayForce = 95000f;
+        public float BreakawayForce = 100000f;
         // Rail geometry is no longer configurable: the three numbers below were
         // tuned against the game's own rail profile until the shoe sat flat on
         // the railhead, and every value away from them is simply wrong. Leaving
@@ -33,19 +34,37 @@ namespace RailwayBrakeShoe
         // Trim added on top of the railhead height taken from the rail profile,
         // measured in game against the loaded model.
         internal const float RailHeadOffset = -0.01764706f;
-        public float RailFrictionCoefficient = 0.05f;
         // Half-length of the shoe's capture window along the rail, in metres.
         // A wheel whose span falls inside this window is riding the shoe.
         public float CaptureHalfLength = 0.22f;
-        public bool ReduceHandbrake;
-        public float HandbrakeMultiplier = 0.90f;
+        public bool ReduceHandbrake = true;
+        public float HandbrakeMultiplier = 0.4f;
         // Both sounds are mixed through the game's own 3D mixer group, so these
         // are multipliers on top of the player's audio settings rather than an
         // absolute level. Zero silences one sound without touching the other.
         public float PlacementVolume = 1f;
         public float FrictionVolume = 1f;
+        // Orientation hazard is sampled while a moving wheel remains against the
+        // wrong face. Speed and frog events have their own one-shot/contact rules.
+        public bool WrongShoeDerailEnabled = true;
+        public float WrongShoeDerailChance = 0.15f;
+        // A shoe being carried into a frog always jams there. The derailment
+        // roll for each later bogie is fixed at 50% by the 1.2.2 rules.
+        // Seconds between hazard rolls while the dangerous contact lasts. Read
+        // through a floor at the use site: a zero here would roll on every
+        // physics step, which is a certain derailment rather than a chance.
+        public float HazardCheckInterval = 3.5f;
+        // Speed hazards are one unified contact event with fixed thresholds and
+        // probabilities; the toggle only lets a player disable that event.
+        public bool SpeedHazardEnabled = true;
+        // v1.2.0: Ejection physics when a shoe is knocked off the rail.
+        public float EjectionImpulseMin = 1.5f;
+        public float EjectionImpulseMax = 3f;
+        // Relative to this car's actual full handbrake force, not a fixed mass.
+        public float HandbrakeEquivalent = 1f;
+        // v1.2.0: Count brake shoes as handbrakes for job completion.
+        public bool BrakeShoeCountsAsHandbrake = true;
         public bool DebugLogging = false;
-        public bool DrawDebug;
 
         public override void Save(UnityModManager.ModEntry modEntry)
         {
@@ -95,6 +114,16 @@ namespace RailwayBrakeShoe
                 PatchIfPresent(typeof(ItemPlacerNonVr), "CancelPlacement", typeof(PlacementPatches), "CancelPlacementPostfix", HarmonyPatchType.Postfix);
                 PatchIfPresent(AccessTools.TypeByName("DV.Simulation.Brake.BrakeSystem"), "SimulateBrakingForce", typeof(HandbrakePatch), "Postfix", HarmonyPatchType.Postfix);
                 PatchIfPresent(AccessTools.TypeByName("I2.Loc.LocalizationManager"), "GetTranslation", typeof(BrakeShoeLocalization), "GetTranslationPostfix", HarmonyPatchType.Postfix);
+                // v1.2.0: Job completion handbrake check. If a car has a brake shoe
+                // near its wheels, count it as having handbrake applied.
+                PatchIfPresent(typeof(DV.Logic.Job.TransportTask), "UpdateTaskState", typeof(JobHandbrakePatch), "Transpiler", HarmonyPatchType.Transpiler);
+                PatchIfPresent(typeof(DV.Logic.Job.TransportTask), "UpdateTaskState", typeof(JobHandbrakePatch), "Postfix", HarmonyPatchType.Postfix);
+                PatchIfPresent(typeof(Bogie), "UpdatePointSetTraveller", typeof(ShoeHoldingPatch), "Prefix", HarmonyPatchType.Prefix);
+                PatchIfPresent(AccessTools.TypeByName("DV.Storages.LostAndFoundItemsSummoner"), "OnSummonPressed", typeof(ShoeRecoveryPatches), "SummonPrefix", HarmonyPatchType.Prefix);
+                PatchIfPresent(AccessTools.TypeByName("DV.Storages.LostAndFoundItemsSummoner"), "OnSummonPressed", typeof(ShoeRecoveryPatches), "SummonFinalizer", HarmonyPatchType.Finalizer);
+                PatchIfPresent(typeof(StorageController), "MoveItemsFromWorldToLostAndFound", typeof(ShoeRecoveryPatches), "FilterTranspiler", HarmonyPatchType.Transpiler);
+                PatchIfPresent(typeof(RespawnOnDrop), "RespawnOrDestroy", typeof(ShoeRecoveryPatches), "RespawnPrefix", HarmonyPatchType.Prefix);
+                ShopStockPatches.Install(harmony);
                 modEntry.Logger.Log("Initialized against the current game assemblies. Optional patches fail closed.");
                 return true;
             }
@@ -134,6 +163,8 @@ namespace RailwayBrakeShoe
             {
                 HarmonyMethod hm = new HarmonyMethod(patch);
                 if (kind == HarmonyPatchType.Prefix) harmony.Patch(target, prefix: hm);
+                else if (kind == HarmonyPatchType.Transpiler) harmony.Patch(target, transpiler: hm);
+                else if (kind == HarmonyPatchType.Finalizer) harmony.Patch(target, finalizer: hm);
                 else harmony.Patch(target, postfix: hm);
             }
             catch (Exception ex)
@@ -144,11 +175,6 @@ namespace RailwayBrakeShoe
 
         private static void Update(UnityModManager.ModEntry entry, float dt)
         {
-            if (Config.DrawDebug)
-            {
-                foreach (BrakeShoeBehaviour shoe in new List<BrakeShoeBehaviour>(Shoes))
-                    if (shoe != null) shoe.DrawDebug();
-            }
         }
 
         // Step for the sliders whose range is a 0..1 fraction. Without it the
@@ -164,13 +190,12 @@ namespace RailwayBrakeShoe
             GUILayout.Label(isRussian ? "Тормозной башмак - физика" : "Railway Brake Shoe - physics");
             Config.DryFriction = Slider(isRussian ? "Трение (сухое)" : "Dry friction", Config.DryFriction, 0.05f, 0.8f, 0.01f);
             Config.WetFrictionMultiplier = Slider(isRussian ? "Множитель (мокрое)" : "Wet multiplier", Config.WetFrictionMultiplier, 0.15f, 1f, 0.01f);
-            Config.MaximumBrakeForce = Slider(isRussian ? "Макс. тормозная сила (Н)" : "Maximum brake force (N)", Config.MaximumBrakeForce, 10000f, 300000f, 1000f);
-            Config.BreakawayForce = Slider(isRussian ? "Порог срыва (Н)" : "Breakaway threshold (N)", Config.BreakawayForce, 10000f, 250000f, 1000f);
+            Config.MaximumBrakeForce = Slider(isRussian ? "Макс. тормозная сила (Н)" : "Maximum brake force (N)", Config.MaximumBrakeForce, 10000f, 1500000f, 10000f);
+            Config.BreakawayForce = Slider(isRussian ? "Порог срыва (Н)" : "Breakaway threshold (N)", Config.BreakawayForce, 10000f, 1250000f, 10000f);
 
             GUILayout.Space(10f);
             GUILayout.Label(isRussian ? "Контакт с колесом" : "Wheel contact");
             Config.CaptureHalfLength = Slider(isRussian ? "Полудлина захвата (м)" : "Capture half-length (m)", Config.CaptureHalfLength, 0.08f, 0.5f, 0f);
-            Config.RailFrictionCoefficient = Slider(isRussian ? "Трение скольжения по рельсу" : "Rail sliding friction", Config.RailFrictionCoefficient, 0.01f, 0.3f, 0f);
 
             GUILayout.Space(10f);
             GUILayout.Label(isRussian ? "Звук" : "Audio");
@@ -178,11 +203,27 @@ namespace RailwayBrakeShoe
             Config.FrictionVolume = Slider(isRussian ? "Громкость трения" : "Friction volume", Config.FrictionVolume, 0f, 1f, FractionSliderStep);
 
             GUILayout.Space(10f);
+            GUILayout.Label(isRussian ? "Аварийные ситуации" : "Hazards");
+            Config.WrongShoeDerailEnabled = GUILayout.Toggle(Config.WrongShoeDerailEnabled, isRussian ? "Сход с рельсов из-за неправильно установленного башмака" : "Derailment from a wrongly placed shoe");
+            Config.WrongShoeDerailChance = Slider(isRussian ? "Шанс схода (неправильный башмак)" : "Derail chance (wrong shoe)", Config.WrongShoeDerailChance, 0f, 1f, 0.01f);
+            Config.HazardCheckInterval = Slider(isRussian ? "Интервал проверки (с)" : "Check interval (s)", Config.HazardCheckInterval, 1f, 10f, 0.5f);
+            Config.SpeedHazardEnabled = GUILayout.Toggle(Config.SpeedHazardEnabled, isRussian ? "Динамический риск на скорости выше 25 км/ч" : "Dynamic speed risk above 25 km/h");
+
+            GUILayout.Space(10f);
+            GUILayout.Label(isRussian ? "Сброс башмака с рельса" : "Shoe ejection");
+            Config.EjectionImpulseMin = Slider(isRussian ? "Мин. боковой импульс (м/с)" : "Min lateral impulse (m/s)", Config.EjectionImpulseMin, 0.2f, 3f, 0.1f);
+            Config.EjectionImpulseMax = Slider(isRussian ? "Макс. боковой импульс (м/с)" : "Max lateral impulse (m/s)", Config.EjectionImpulseMax, 0.5f, 6f, 0.1f);
+
+            GUILayout.Space(10f);
+            GUILayout.Label(isRussian ? "Удерживающая сила" : "Holding force");
+            Config.HandbrakeEquivalent = Slider(isRussian ? "Эквивалент ручных тормозов" : "Equivalent handbrakes", Config.HandbrakeEquivalent, 0.1f, 2f, 0.1f);
+
+            GUILayout.Space(10f);
             GUILayout.Label(isRussian ? "Прочее" : "Other");
+            Config.BrakeShoeCountsAsHandbrake = GUILayout.Toggle(Config.BrakeShoeCountsAsHandbrake, isRussian ? "Башмак заменяет ручник при сдаче заданий" : "Brake shoe counts as handbrake for job completion");
             Config.ReduceHandbrake = GUILayout.Toggle(Config.ReduceHandbrake, isRussian ? "Опционально снизить эффективность ручника" : "Optionally reduce handbrake effectiveness");
             Config.HandbrakeMultiplier = Slider(isRussian ? "Множитель ручника" : "Handbrake multiplier", Config.HandbrakeMultiplier, 0.1f, 1f, FractionSliderStep);
             Config.DebugLogging = GUILayout.Toggle(Config.DebugLogging, isRussian ? "Логирование отладки состояния" : "Debug state logging");
-            Config.DrawDebug = GUILayout.Toggle(Config.DrawDebug, isRussian ? "Рисовать линии контакта/силы" : "Draw contact/force debug lines");
 
             GUILayout.Space(10f);
             GUILayout.Label(isRussian ? "Требуется custom_item_mod 0.2.x; предмет/магазин/сохранение обеспечивается им." : "Requires custom_item_mod 0.2.x; item/shop/save lifecycle is provided by it.");
@@ -232,6 +273,140 @@ namespace RailwayBrakeShoe
         internal static void LogAlways(string text)
         {
             if (Entry != null && Entry.Logger != null) Entry.Logger.Log(text);
+        }
+    }
+
+    /// <summary>
+    /// The stable surface other mods may call. Everything here answers from the
+    /// mod's own engagement state, so a caller never has to measure distances or
+    /// know what "correctly placed" means.
+    ///
+    /// Meant to be used without a hard dependency. A caller that does not want to
+    /// reference this assembly can reach the same answers reflectively:
+    ///
+    ///     Type api = AccessTools.TypeByName("RailwayBrakeShoe.BrakeShoeAPI");
+    ///     bool secured = api != null &amp;&amp;
+    ///         (bool)api.GetMethod("IsCarSecured").Invoke(null, new object[] { car });
+    ///
+    /// A null Type means the mod is absent, which is the caller's "no shoe" case.
+    /// Nothing here throws: every method is guarded and answers false rather than
+    /// propagating an exception into the caller's frame.
+    ///
+    /// The signatures below are the mod's public contract. Later versions may add
+    /// members, but these keep their names, parameters and meanings.
+    /// </summary>
+    public static class BrakeShoeAPI
+    {
+        /// <summary>
+        /// Version of this API surface, not of the mod. Bumped only if a member
+        /// here changes meaning, so a caller can gate on it.
+        /// </summary>
+        public static int ApiVersion { get { return 1; } }
+
+        /// <summary>
+        /// True when at least one shoe is holding this car: correctly placed,
+        /// under one of its wheels, and actually able to resist.
+        ///
+        /// This is the question a mod asking "is this car secured?" wants. It is
+        /// the same test the friction code uses to decide a shoe contributes
+        /// braking force, so it cannot drift from the physics: a shoe lying the
+        /// wrong way round, one merely resting nearby, and one a wheel is rolling
+        /// off all answer false.
+        /// </summary>
+        public static bool IsCarSecured(TrainCar car)
+        {
+            if (car == null) return false;
+            try
+            {
+                foreach (BrakeShoeBehaviour shoe in Main.Shoes)
+                {
+                    if (shoe == null) continue;
+                    shoe.RefreshJobSecurity(car);
+                    if (shoe.SecuredCar == car) return true;
+                }
+            }
+            catch (Exception ex) { Main.Log("API IsCarSecured failed: " + ex.Message); }
+            return false;
+        }
+
+        /// <summary>
+        /// How many shoes are holding this car, for a caller that wants to know
+        /// whether both ends are chocked rather than just that one shoe is on.
+        /// </summary>
+        public static int GetSecuringShoeCount(TrainCar car)
+        {
+            if (car == null) return 0;
+            int count = 0;
+            try
+            {
+                foreach (BrakeShoeBehaviour shoe in Main.Shoes)
+                {
+                    if (shoe == null) continue;
+                    shoe.RefreshJobSecurity(car);
+                    if (shoe.SecuredCar == car) count++;
+                }
+            }
+            catch (Exception ex) { Main.Log("API GetSecuringShoeCount failed: " + ex.Message); }
+            return count;
+        }
+
+        /// <summary>
+        /// True when a wheel of this car is touching a shoe at all, however the
+        /// shoe is lying. Includes the wrongly placed case, which
+        /// <see cref="IsCarSecured"/> deliberately excludes, so a caller can tell
+        /// "chocked" from "merely in contact".
+        /// </summary>
+        public static bool IsCarInShoeContact(TrainCar car)
+        {
+            if (car == null) return false;
+            try
+            {
+                foreach (BrakeShoeBehaviour shoe in Main.Shoes)
+                {
+                    if (shoe == null) continue;
+                    if (shoe.ContactCar == car) return true;
+                }
+            }
+            catch (Exception ex) { Main.Log("API IsCarInShoeContact failed: " + ex.Message); }
+            return false;
+        }
+
+        /// <summary>
+        /// True when a shoe is placed on a rail within <paramref name="radius"/>
+        /// metres of the car's body, whether or not a wheel is on it. For a caller
+        /// that wants "is there a shoe by this car" rather than "is it holding".
+        /// Only anchored shoes count; one in a hand or a crate is not on the track.
+        /// </summary>
+        public static bool IsShoeNearCar(TrainCar car, float radius)
+        {
+            return GetNearestShoeDistance(car) <= Mathf.Max(0f, radius);
+        }
+
+        /// <summary>
+        /// Distance in metres from the car's body to the nearest anchored shoe, or
+        /// float.PositiveInfinity when there is none. Measured to the car's own
+        /// bounds, so it does not vary with car length the way a centre-to-shoe
+        /// distance would.
+        /// </summary>
+        public static float GetNearestShoeDistance(TrainCar car)
+        {
+            if (car == null) return float.PositiveInfinity;
+            float best = float.PositiveInfinity;
+            try
+            {
+                foreach (BrakeShoeBehaviour shoe in Main.Shoes)
+                {
+                    if (shoe == null || !shoe.IsAnchored) continue;
+                    // Into the car's local frame first: Bounds is axis-aligned in
+                    // local space, and a world-space box around a car sitting at an
+                    // angle would reach well past its actual body.
+                    Vector3 local = car.transform.InverseTransformPoint(shoe.transform.position);
+                    float distance = Mathf.Sqrt(car.Bounds.SqrDistance(local));
+                    if (distance < best) best = distance;
+                }
+            }
+            catch (Exception ex) { Main.Log("API GetNearestShoeDistance failed: " + ex.Message); }
+            return best;
         }
     }
 
@@ -333,7 +508,7 @@ namespace RailwayBrakeShoe
                 // ShopItemData.ItemsInStock is allowedToHaveAmount minus
                 // purchasedItems. Twenty shoes is enough to pin a long rake.
                 info.Amount = 20;
-                info.Price = 25000;
+                info.Price = (int)ShopPricePatches.BrakeShoePrice;
                 info.PreviewRotation = Vector3.zero;
                 // The supplied shelf prefab owns its local display pose.
                 info.ShelfRotation = Vector3.zero;
@@ -383,8 +558,8 @@ namespace RailwayBrakeShoe
 
     }
 
-    // ShopRework compatibility: preserve catalogue prices around vanilla
-    // non-Career zeroing and keep ShopRework's baseline dictionary current.
+    // Preserves catalogue prices around vanilla's non-Career zeroing, and keeps
+    // ShopRework's baseline dictionary current when that mod is installed.
     // Restores the brake shoe price and all other affected catalogue entries.
     internal static class ShopPricePatches
     {
@@ -394,6 +569,48 @@ namespace RailwayBrakeShoe
         private static readonly MethodInfo ShopReworkGetShopNameMethod = ShopReworkManagerType == null ? null : AccessTools.Method(ShopReworkManagerType, "GetShopNameFromItem");
         private static readonly Dictionary<string, float> OriginalBasePrices = new Dictionary<string, float>(StringComparer.OrdinalIgnoreCase);
         private static bool refreshingPriceText;
+        private static bool loggedGameModeFailure;
+
+        private const float CareerBrakeShoePrice = 250f;
+
+        // Vanilla prices goods in Career only: InitializeShopData zeroes the
+        // basePrice of every item that is not careerOnly in any other game mode.
+        // The shoe is registered after that pass, so vanilla never reaches it and
+        // the price has to be matched to the session here, or the shoe would be
+        // the one item on the shelf still carrying a price tag in a sandbox save.
+        internal static float BrakeShoePrice
+        {
+            get { return IsCareerSession ? CareerBrakeShoePrice : 0f; }
+        }
+
+        // Read fresh rather than cached: returning to the main menu and loading a
+        // save in another mode reuses the process, so a cached answer would price
+        // the shoe for the previous session's mode.
+        private static bool IsCareerSession
+        {
+            get
+            {
+                try
+                {
+                    DV.UserManagement.UserManager manager = DV.Utils.SingletonBehaviour<DV.UserManagement.UserManager>.Instance;
+                    if (manager == null || manager.CurrentUser == null) return true;
+                    DV.Common.IGameSession session = manager.CurrentUser.CurrentSession;
+                    if (session == null) return true;
+                    return session.GameMode == "Career";
+                }
+                catch (Exception ex)
+                {
+                    // Fall back to the priced behaviour: charging in a sandbox save
+                    // is the lesser fault against handing out free goods in career.
+                    if (!loggedGameModeFailure)
+                    {
+                        loggedGameModeFailure = true;
+                        Main.Log("Could not read the session game mode, assuming Career: " + ex.Message);
+                    }
+                    return true;
+                }
+            }
+        }
 
         // In non-career sessions vanilla intentionally zeroes every ShopItemData
         // during initialization. ShopRework then caches those zeroes as the
@@ -423,7 +640,7 @@ namespace RailwayBrakeShoe
                 if (data == null || data.item == null) continue;
                 if (IsBrakeShoe(data.item))
                 {
-                    data.basePrice = 25000f;
+                    data.basePrice = BrakeShoePrice;
                     continue;
                 }
 
@@ -461,10 +678,12 @@ namespace RailwayBrakeShoe
             if (data == null) return;
 
             float basePrice;
-            if (brakeShoe) basePrice = 25000f;
+            if (brakeShoe) basePrice = BrakeShoePrice;
             else if (!ShopReworkActive || !TryGetCataloguePrice(__instance.sellingItemSpec, out basePrice)) return;
 
-            if (data.pricePerUnit <= 0f) data.pricePerUnit = basePrice;
+            // This mod owns the shoe's price outright, so write it either way;
+            // for other products only a missing price is filled in.
+            if (brakeShoe || data.pricePerUnit <= 0f) data.pricePerUnit = basePrice;
             if (ShopReworkActive) UpdateShopReworkBaseline(__instance, basePrice);
         }
 
@@ -487,12 +706,13 @@ namespace RailwayBrakeShoe
             CashRegisterModule.CashRegisterModuleData data = __instance.Data;
             if (data == null) return;
 
+            float price = BrakeShoePrice;
             float previous = data.pricePerUnit;
-            data.pricePerUnit = 25000f;
+            data.pricePerUnit = price;
             // ShopRework can cache a zero before this postfix runs. Re-run the
             // vanilla formatter once after correcting the data so the visible
             // register text is refreshed without touching other products.
-            if (Mathf.Approximately(previous, 25000f)) return;
+            if (Mathf.Approximately(previous, price)) return;
             refreshingPriceText = true;
             try { __instance.UpdateTexts(); }
             finally { refreshingPriceText = false; }
@@ -501,9 +721,13 @@ namespace RailwayBrakeShoe
         internal static void EnsureBrakeShoePrice(CustomItem customItem)
         {
             if (customItem == null || customItem.ShopData == null) return;
-            customItem.ShopData.basePrice = 25000f;
+            float price = BrakeShoePrice;
+            customItem.ShopData.basePrice = price;
+            ShopStockPatches.EnsureGlobalCapacity(customItem.ShopData);
             string key = GetItemKey(customItem.ItemSpec);
-            if (!string.IsNullOrEmpty(key)) OriginalBasePrices[key] = 25000f;
+            // The cache holds real prices only; a free sandbox shoe must not be
+            // remembered as this item's catalogue price.
+            if (!string.IsNullOrEmpty(key) && price > 0f) OriginalBasePrices[key] = price;
         }
 
         private static bool ShopReworkActive
@@ -524,8 +748,9 @@ namespace RailwayBrakeShoe
             if (spec == null) return false;
             if (IsBrakeShoe(spec))
             {
-                price = 25000f;
-                return true;
+                // False outside Career leaves the shoe at $0 like everything else.
+                price = BrakeShoePrice;
+                return price > 0f;
             }
 
             string key = GetItemKey(spec);
@@ -1140,7 +1365,7 @@ namespace RailwayBrakeShoe
         }
     }
 
-    public sealed class BrakeShoeBehaviour : MonoBehaviour, ICustomNonVRGrabAnchor
+    public sealed partial class BrakeShoeBehaviour : MonoBehaviour, ICustomNonVRGrabAnchor
     {
         // StopContact was dropped here: nothing assigned it and nothing compared
         // against it. It described the shoe's stop end being struck, which was a
@@ -1196,7 +1421,7 @@ namespace RailwayBrakeShoe
         private ShoeState stateValue = ShoeState.Free;
         private Rigidbody body;
         private Vector3 lastForce;
-        private bool snappedToRail;
+        internal bool snappedToRail;
         private ItemSaveData saveData;
         private DV.CabControls.ItemBase item;
 
@@ -1211,12 +1436,136 @@ namespace RailwayBrakeShoe
         private bool isReversed;
         private float railSide; // -1 or +1: which of the two rails
         private bool spanValid;
+        // Job completion may sample between physics steps. Keep the tolerance
+        // small and tied to the shoe's measured capture zone rather than
+        // accepting an arbitrary nearby wagon.
+        // Maximum distance from the shoe's anchored span at which the target
+        // car's axle may still be considered secured during a job query.  The
+        // value remains bounded: it is large enough to cover the measured wheel
+        // contact envelope, but never becomes a general nearby-car radius.
+        private const float SecuredWheelTolerance = 0.35f;
+        // Search radius used only to find a candidate wheel for job validation.
+        // Eligibility is still decided by the contact envelope, orientation and
+        // existing holding state below; this is deliberately not a secured radius.
+        private const double SecuredWheelSearchRadius = 1.0;
 
         // Read by the placement code to reject a spot that is already taken. The
         // anchor is the authoritative "where this shoe is": the transform can lag
         // by a physics step, and a shoe being carried by a wheel keeps moving.
         internal bool IsAnchored { get { return snappedToRail && spanValid && currentTrack != null; } }
         internal RailTrack AnchoredTrack { get { return currentTrack; } }
+
+        /// <summary>
+        /// The car this shoe is holding, or null when it is holding nothing.
+        ///
+        /// Backed by the same latch the friction code counts, so "secured" here
+        /// means exactly what it means to the physics: the wheel is up on the
+        /// working surface with the wedge engaged. A shoe lying the wrong way
+        /// round clears offsetLocked, so it answers null however hard the wheel
+        /// is pressing on its end stop.
+        /// </summary>
+        public TrainCar SecuredCar
+        {
+            get
+            {
+                if (!IsAnchored || contactFromBehind || !offsetLocked ||
+                    jammedInFrog || !HasStaticHold) return null;
+                if (!wheelTouching && !WithinSecuredWheelTolerance()) return null;
+                return contactCar;
+            }
+        }
+
+        // Career checks can run between FixedUpdate ticks. Refresh only the
+        // deterministic contact snapshot (and create the same static joint the
+        // physics tick would create) so an unchanged shoe cannot alternate
+        // between secured and unsecured depending on callback order.
+        internal bool RefreshJobSecurity(TrainCar car)
+        {
+            if (!IsAnchored || car == null) return false;
+            Bogie bogie;
+            double axle;
+            float direction;
+            // Resolve the candidate for this exact car.  Looking up the nearest
+            // axle globally and comparing its car afterwards made a neighbouring
+            // wagon mask a valid shoe on the requested wagon.
+            if (!TryFindEngagedAxle(car, SecuredWheelSearchRadius, out bogie, out axle, out direction) || bogie == null || bogie.Car != car)
+                return false;
+            float speed = bogie.rb == null ? 0f : Mathf.Abs(Vector3.Dot(bogie.rb.velocity, bogie.transform.forward));
+            // A joint that already holds this exact bogie is authoritative. The
+            // solver can leave a small residual Rigidbody velocity for one frame
+            // after the wheel stops; rejecting it here made an unchanged held
+            // wagon appear unsecured depending on when the job button sampled.
+            bool existingHold = HasStaticHold && holdingBogie == bogie;
+            if (speed > StopExitSpeed && !existingHold) return false;
+            double work = isReversed ? -1.0 : 1.0;
+            double along = (axle - railSpan) * work;
+            double back = BrakeShoeFactory.VisualBounds.size.z * BrakeShoeFactory.StopOuterFace +
+                WheelClearanceForHeight(GetWheelRadius(car), BrakeShoeFactory.VisualBounds.size.y);
+            double capture = Main.Config.CaptureHalfLength;
+            double tolerance = SecuredWheelTolerance;
+            bool withinPhysicalContact = along >= -capture && along <= back;
+            // A job check may run before the first physics contact (manual
+            // placement) or just after a step has released the transient
+            // wheelTouching flag. Permit only the small, bounded ramp-side gap;
+            // TryHoldStoppedWheel below still requires a stopped Rigidbody,
+            // sufficient capacity and the same physical joint path.
+            bool withinStableTolerance = along < -capture &&
+                along >= -tolerance;
+            if ((!withinPhysicalContact && !withinStableTolerance) ||
+                along > BrakeShoeFactory.VisualBounds.size.z * BrakeShoeFactory.StopBoxCentre)
+                return false;
+            // The geometric face test above has established the correct side of
+            // this shoe for this wheel.  Clear a stale wrong-way latch from a
+            // previous contact before asking the existing holding path to reuse
+            // or create its joint.
+            contactFromBehind = false;
+            contactBogie = bogie;
+            contactCar = car;
+            wheelTouching = true;
+            if (!offsetLocked)
+            {
+                capturedSpanOffset = axle - railSpan;
+                offsetLocked = true;
+                pushSpanDirection = 0.0;
+            }
+            TryHoldStoppedWheel(bogie, speed, work);
+            return SecuredCar == car;
+        }
+
+        private bool WithinSecuredWheelTolerance()
+        {
+            Bogie bogie;
+            double axle;
+            float direction;
+            if (!TryFindEngagedAxle(contactCar, SecuredWheelSearchRadius, out bogie, out axle, out direction) || bogie == null || bogie.Car != contactCar)
+                return false;
+            return Math.Abs(axle - railSpan) <= SecuredWheelTolerance;
+        }
+
+        /// <summary>
+        /// The car whose wheel is touching this shoe in any fashion, including the
+        /// wrongly placed case. Null when no wheel is in reach.
+        /// </summary>
+        public TrainCar ContactCar
+        {
+            get { return IsAnchored && wheelTouching ? contactCar : null; }
+        }
+
+        /// <summary>
+        /// True while the wheel in contact arrived at the back of the end stop,
+        /// i.e. the shoe is lying the wrong way round for it.
+        /// </summary>
+        public bool IsWrongWayRound
+        {
+            get { return IsAnchored && wheelTouching && contactBogie != null && contactFromBehind; }
+        }
+
+        /// <summary>
+        /// True once this shoe has jammed in a switch frog and become an obstacle
+        /// on the railhead rather than a brake.
+        /// </summary>
+        public bool IsJammedInFrog { get { return jammedInFrog; } }
+
         internal double AnchoredSpan { get { return railSpan; } }
         internal float AnchoredSide { get { return railSide; } }
 
@@ -1250,6 +1599,57 @@ namespace RailwayBrakeShoe
         // StopExitSpeed to be moving again, so a wheel hovering between them
         // keeps whichever state it already had.
         private bool wheelStopped;
+
+        // Whether the wheel found this step is genuinely touching the shoe rather
+        // than merely being the nearest one on the track.
+        //
+        // contactBogie alone does not mean contact: TryFindEngagedAxle searches
+        // out to CaptureHalfLength + 3 m so the approach can be seen coming, and
+        // it assigns contactBogie for any wheel inside that. The hazard layer must
+        // not roll against a wheel three metres away, so the reach test's own
+        // verdict is recorded here instead of being inferred from the fields.
+        private bool wheelTouching;
+
+        // Hazard state. Kept apart from the engagement fields above so the
+        // existing physics never reads it and cannot be changed by it.
+        //
+        // When the next hazard roll is due. One timer covers both hazards
+        // because a shoe cannot be jammed in a frog and be chocking a wheel the
+        // wrong way round at the same moment, and it is set on the step contact
+        // begins rather than at zero, so the first roll comes after a full
+        // interval instead of immediately on touch.
+        private float nextHazardCheck;
+        // The car the wrong-way timer belongs to. A new car arriving at the shoe
+        // restarts the countdown; without this a second wheel would inherit the
+        // elapsed time of the first and could be rolled against instantly.
+        private TrainCar hazardContactCar;
+        // Set once the shoe has jammed in a frog. From then on it is an obstacle:
+        // it no longer travels with the wheel that was pushing it, and each axle
+        // passing over it is rolled against.
+        private bool jammedInFrog;
+        // Where it jammed, kept only for the log line.
+        private string jammedJunctionName;
+        // Whether this dragged shoe has already been latched in the current frog
+        // window, so the deterministic jam is applied only once per approach.
+        private bool frogJamRolled;
+        // The bogie last rolled against while the shoe sits jammed, so a single
+        // axle standing on it is not rolled against on the same timer as the
+        // axles still arriving.
+        private Bogie jammedRolledBogie;
+
+        // Half-length of the window around a junction node, in metres of span,
+        // inside which a travelling shoe is treated as being at the frog. The
+        // frog is the crossing casting where the rails intersect and a shoe
+        // dragged into it has somewhere to wedge; a metre either side of the node
+        // covers that casting on DV's switches without reaching into plain track.
+        private const double FrogWindowHalfLength = 1.0;
+
+        // v1.2.0: High-speed collision hazard. One-shot flag per contact to ensure
+        // the high-speed check fires only once at first contact, not on every step.
+        private bool highSpeedRolled;
+
+        // v1.2.0: Track the last bogie speed to detect high-speed collisions.
+        private float lastBogieSpeed;
 
         // Whether the ItemBase lifecycle events are currently subscribed. The
         // control is created by the game after this component, so subscribing
@@ -1335,6 +1735,7 @@ namespace RailwayBrakeShoe
         private float restoreSide;
         private double restoreSpan;
         private bool restoreSpanKnown;
+        private bool restoreJammed;
         private Vector3 restorePosition;
         private float restoreDeadline;
         private float nextRestoreAttempt;
@@ -1353,6 +1754,14 @@ namespace RailwayBrakeShoe
         // source on Awake would add an AudioSource to every shoe in the world
         // and to every one sitting in a shop or an inventory.
         private AudioSource frictionAudio;
+        // Reuses the game's WheelslipSparks prefab, but keeps the instance on
+        // this shoe so the stock wheel spark controllers remain untouched.
+        private static GameObject wheelSparksPrefab;
+        private static bool wheelSparksPrefabAttempted;
+        private GameObject shoeSparksObject;
+        private ParticleSystem[] shoeSparks;
+        private float nextSparkTime;
+        private const float SparkInterval = 0.08f;
         // Smoothed drive value for that loop, so volume and pitch follow the
         // slide instead of snapping between physics steps. The smoothing
         // constant mirrors what CarFrictionAudioModule does for the cars' own
@@ -1374,6 +1783,7 @@ namespace RailwayBrakeShoe
 
         private void Awake()
         {
+            ShopStockPatches.Track(this);
             body = GetComponent<Rigidbody>();
             item = GetComponent<DV.CabControls.ItemBase>();
             respawnOnDrop = FindRespawnOnDrop();
@@ -1393,11 +1803,13 @@ namespace RailwayBrakeShoe
         }
         private void OnDisable()
         {
+            ReleaseStaticHold();
             Main.Shoes.Remove(this);
             // Items are disabled rather than destroyed when they go into a
             // container or a belt slot, and a disabled MonoBehaviour stops
             // getting FixedUpdate while its child AudioSource keeps playing.
             StopFrictionAudio();
+            StopFrictionSparks();
             // The same reasoning applies to the ray block, and more sharply: no
             // FixedUpdate means nothing is left to clear it, so a shoe disabled
             // mid-roll would come back out of the container unpickable.
@@ -1405,6 +1817,8 @@ namespace RailwayBrakeShoe
         }
         private void OnDestroy()
         {
+            ReleaseStaticHold();
+            ShopStockPatches.Untrack(this);
             Main.Shoes.Remove(this);
             // A restore in flight must not outlive the component: items are
             // pooled, so a reused instance would otherwise start life holding a
@@ -1421,6 +1835,8 @@ namespace RailwayBrakeShoe
             // delegate has to come off with it or the reused item would spawn
             // permanently unpickable.
             ReleasePickupBlock();
+            StopFrictionSparks();
+            if (shoeSparksObject != null) UnityEngine.Object.Destroy(shoeSparksObject);
             UnhookItemEvents();
             if (saveData != null)
             {
@@ -1432,6 +1848,7 @@ namespace RailwayBrakeShoe
         private JObject SaveState(JObject data)
         {
             if (data == null) data = new JObject();
+            if (!string.IsNullOrEmpty(PurchaseShopId)) data["railwayBrakeShoeShop"] = PurchaseShopId;
             data["railwayBrakeShoePlaced"] = snappedToRail;
             data["railwayBrakeShoeState"] = State.ToString();
             if (snappedToRail && currentTrack != null)
@@ -1448,16 +1865,20 @@ namespace RailwayBrakeShoe
                 // as "disappeared" even though the item itself was fine, which
                 // is why summoning lost items still produced it.
                 //
-                // The game never persists a track by name either. CarsSaveManager
-                // stores an index into OrderedRailtracks, and the registry's
-                // TracksHash is built from GameObjectUtils.GetPath. That full
-                // hierarchy path is the identifier used here, with the name kept
-                // only so saves written by earlier versions still load.
+                // The game does not persist a track by name. The path is the first
+                // discriminator, while the saved world position resolves duplicate
+                // paths (turntables and switch branches intentionally share names).
+                // The name remains as a compatibility fallback for older saves.
                 data["railwayBrakeShoeTrackPath"] = RailPlacement.GetTrackPath(currentTrack);
                 data["railwayBrakeShoeTrackName"] = currentTrack.name;
                 data["railwayBrakeShoeReversed"] = isReversed;
                 data["railwayBrakeShoeSide"] = railSide;
                 data["railwayBrakeShoeSpan"] = railSpan;
+                // A shoe wedged in a crossing is still wedged there after a
+                // reload; the whole point of the hazard is that it stays until
+                // somebody picks it up. Written unconditionally so a shoe that has
+                // been freed also records that.
+                data["railwayBrakeShoeJammed"] = jammedInFrog;
             }
             return data;
         }
@@ -1465,6 +1886,8 @@ namespace RailwayBrakeShoe
         private void LoadState(JObject data)
         {
             if (data == null) return;
+            JToken shop = data["railwayBrakeShoeShop"];
+            PurchaseShopId = shop != null && shop.Type == JTokenType.String ? (string)shop : null;
             JToken placed = data["railwayBrakeShoePlaced"];
             if (placed == null || placed.Type != JTokenType.Boolean || !(bool)placed) return;
 
@@ -1473,6 +1896,7 @@ namespace RailwayBrakeShoe
             JToken reversed = data["railwayBrakeShoeReversed"];
             JToken side = data["railwayBrakeShoeSide"];
             JToken span = data["railwayBrakeShoeSpan"];
+            JToken jammed = data["railwayBrakeShoeJammed"];
 
             string savedPath = trackPath != null && trackPath.Type == JTokenType.String ? (string)trackPath : null;
             string savedName = trackName != null && trackName.Type == JTokenType.String ? (string)trackName : null;
@@ -1498,6 +1922,7 @@ namespace RailwayBrakeShoe
             restoreSide = s;
             restoreSpan = sp;
             restoreSpanKnown = haveSpan;
+            restoreJammed = jammed != null && jammed.Type == JTokenType.Boolean && (bool)jammed;
             restorePosition = transform.position;
             restoreDeadline = Time.time + RestoreWindowSeconds;
             nextRestoreAttempt = 0f;
@@ -1559,6 +1984,13 @@ namespace RailwayBrakeShoe
             // respawn suspension, because AttachToRail below wants both anyway.
             restoreHoldActive = false;
             AttachToRail(track, restoreReversed, restoreSide, restoreSpan, restoreSpanKnown);
+            // After the attach, which clears the flag as part of putting a shoe on
+            // a rail. A shoe saved wedged in a crossing is still wedged there.
+            if (restoreJammed)
+            {
+                jammedInFrog = true;
+                Main.LogAlways("Restored brake shoe is still jammed in a switch frog.");
+            }
             if (restoreAttempts > 1)
                 Main.LogAlways("Placed shoe returned to its rail after " + restoreAttempts + " attempts.");
         }
@@ -1670,6 +2102,10 @@ namespace RailwayBrakeShoe
             spanValid = currentTrack != null;
             snappedToRail = spanValid;
             State = spanValid ? ShoeState.Placed : ShoeState.Free;
+            // A shoe being put on a rail is a shoe that is not stuck in anything.
+            // The restore path re-applies a saved jam right after this returns.
+            jammedInFrog = false;
+            jammedJunctionName = null;
             ClearEngagement();
 
             if (body != null)
@@ -1680,6 +2116,9 @@ namespace RailwayBrakeShoe
                 // with MovePosition along their traveller rather than being left
                 // to PhysX, and the shoe must ride the same way to stay aligned.
                 body.isKinematic = true;
+                // v1.2.0: ContinuousSpeculative for kinematic bodies to prevent
+                // fast-moving wheels from phasing through the shoe.
+                body.collisionDetectionMode = CollisionDetectionMode.ContinuousSpeculative;
                 // The pose is only recomputed in FixedUpdate, so without
                 // interpolation the shoe is redrawn at the same 50 Hz staircase
                 // while the camera and the train move at frame rate. That reads
@@ -1878,11 +2317,9 @@ namespace RailwayBrakeShoe
                 return;
             }
 
-            Main.Log("StopRespawnWatchers: attempting to stop watchers");
             try
             {
                 CoroutineManager manager = DV.Utils.SingletonBehaviour<CoroutineManager>.Instance;
-                Main.Log("StopRespawnWatchers: CoroutineManager obtained: " + (manager != null));
                 StopRespawnWatcher(manager, RespawnCheckerCoroField, "Checker");
                 StopRespawnWatcher(manager, RespawnOrDestroyCoroField, "RespawnOrDestroy");
             }
@@ -1900,7 +2337,6 @@ namespace RailwayBrakeShoe
                 return;
             }
             Coroutine running = field.GetValue(respawnOnDrop) as Coroutine;
-            Main.Log("StopRespawnWatcher(" + name + "): coroutine handle is " + (running == null ? "null" : "not null"));
             if (running == null) return;
             // Cleared first. If Stop throws, the handle is still dropped, so the
             // item is left in the state OnEnable can recover from rather than
@@ -2040,7 +2476,7 @@ namespace RailwayBrakeShoe
             DetachFromRailInternal();
         }
 
-        private void DetachFromRailInternal()
+        private void DetachFromRailInternal(bool preserveWorldStorage = false)
         {
             currentTrack = null;
             spanValid = false;
@@ -2056,12 +2492,21 @@ namespace RailwayBrakeShoe
             // Before anything else: a shoe that is no longer on a rail must not
             // stay listed in the world storage on this mod's account, or it is
             // serialized alongside the held-item record and comes back twice.
-            ReleaseWorldStorageRegistration();
+            if (!preserveWorldStorage) ReleaseWorldStorageRegistration();
+            // Taking the shoe off the rail is what frees it from a frog: the jam is
+            // a fact about it sitting in that crossing, and the shoe is no longer
+            // there. Cleared before ClearEngagement, which deliberately leaves the
+            // flag alone so a wheel rolling clear does not un-jam it.
+            jammedInFrog = false;
+            jammedJunctionName = null;
             ClearEngagement();
             // A shoe that is no longer on a rail cannot be scraping one, and
             // FixedUpdate now returns before UpdateFrictionAudio, so the loop has
             // to be stopped here rather than left to fade.
             StopFrictionAudio();
+            // FixedUpdate also returns before the normal particle cleanup path
+            // after a detach, so clear the local stock spark systems here too.
+            StopFrictionSparks();
             // Same reasoning for the ray block: the state this depends on is
             // gone, and UpdatePickupBlock is no longer reached to clear it.
             ReleasePickupBlock();
@@ -2077,6 +2522,8 @@ namespace RailwayBrakeShoe
                 // body is stepped by PhysX and the grab code moves it
                 // directly, so leave that path exactly as it was.
                 body.interpolation = RigidbodyInterpolation.None;
+                // v1.2.0: Restore ContinuousDynamic for dynamic bodies.
+                body.collisionDetectionMode = CollisionDetectionMode.ContinuousDynamic;
             }
         }
 
@@ -2166,21 +2613,6 @@ namespace RailwayBrakeShoe
             bool checkStorage = Time.time >= nextStorageCheck;
             if (checkStorage) nextStorageCheck = Time.time + StorageCheckInterval;
 
-            // The game moved the shoe to the shed. MoveItemsFromWorldToLostAndFound
-            // takes it out of the world storage, puts it in lost and found and
-            // repositions it there, but nothing tells this component, so the rail
-            // anchor survived and ApplyRailPose dragged the shoe straight back to
-            // the track it used to sit on. That is the shoe appearing at the shed
-            // for a single frame and vanishing. Releasing the anchor here leaves
-            // the shoe where the shed put it.
-            if (snappedToRail && checkStorage && IsInLostAndFound())
-            {
-                DetachFromRail("moved to lost and found");
-                StopFrictionAudio();
-                ReleasePickupBlock();
-                return;
-            }
-
             if (!snappedToRail || !spanValid || currentTrack == null)
             {
                 StopFrictionAudio();
@@ -2212,6 +2644,9 @@ namespace RailwayBrakeShoe
                 body.velocity = Vector3.zero;
                 body.angularVelocity = Vector3.zero;
                 body.isKinematic = true;
+                // v1.2.0: ContinuousSpeculative for kinematic bodies to prevent
+                // fast-moving wheels from phasing through the shoe.
+                body.collisionDetectionMode = CollisionDetectionMode.ContinuousSpeculative;
                 body.interpolation = RigidbodyInterpolation.Interpolate;
             }
 
@@ -2227,6 +2662,11 @@ namespace RailwayBrakeShoe
             if (checkStorage) EnsureWorldStorageRegistration();
 
             UpdateWheelEngagement();
+            // Strictly after engagement and strictly before the shoe is moved:
+            // this reads the contact state engagement just settled, and a jam has
+            // to be in effect before the span is followed and the pose applied,
+            // so a shoe that jams this step is not carried one more step first.
+            UpdateHazards();
             // Between the two: engagement is what pushes the span past the end of
             // the track, and the pose has to be sampled from whichever track the
             // shoe belongs to afterwards. Doing it here also means the span handed
@@ -2237,6 +2677,7 @@ namespace RailwayBrakeShoe
             // After the pose, so the audio host has already been moved to where
             // the shoe is being heard this step.
             UpdateFrictionAudio();
+            UpdateFrictionSparks();
             // Last: UpdateWheelEngagement above has settled this step's state,
             // and the block is a function of that state.
             UpdatePickupBlock();
@@ -2330,6 +2771,100 @@ namespace RailwayBrakeShoe
         }
 
         /// <summary>
+        /// Emits a small burst from the game's own WheelslipSparks prefab while
+        /// this shoe is genuinely sliding under load. The prefab is instantiated
+        /// lazily, and every burst is explicitly emitted so a parked or merely
+        /// placed shoe cannot leave a continuously running particle system.
+        /// </summary>
+        private void UpdateFrictionSparks()
+        {
+            bool scraping = IsAnchored && isScraping && slideSpeed > 0.05f &&
+                (State == ShoeState.Sliding || State == ShoeState.Breakaway);
+            if (!scraping)
+            {
+                StopFrictionSparks();
+                return;
+            }
+            if (Time.time < nextSparkTime) return;
+            nextSparkTime = Time.time + SparkInterval;
+            if (!EnsureFrictionSparks()) return;
+
+            // The rail contact is below the shoe body. Keep the stock spark
+            // orientation aligned with the rail direction at that contact.
+            float halfHeight = BrakeShoeFactory.VisualBounds.size.y > 0f
+                ? BrakeShoeFactory.VisualBounds.size.y * 0.5f : 0.061f;
+            Vector3 contact = transform.position - transform.up * (halfHeight + 0.002f);
+            // Emit opposite to the measured wheel/shoe travel. The small
+            // downward component sends the particles back toward the rail;
+            // using the signed velocity means reverse motion flips naturally.
+            float alongSpeed = 0f;
+            if (contactBogie != null && contactBogie.rb != null)
+                alongSpeed = Vector3.Dot(contactBogie.rb.velocity, transform.forward);
+            if (Mathf.Abs(alongSpeed) < 0.05f && pushSpanDirection != 0.0)
+                alongSpeed = (float)pushSpanDirection * slideSpeed;
+            float travelSign = alongSpeed < 0f ? -1f : 1f;
+            Vector3 travel = transform.forward * travelSign;
+            Vector3 sparkDirection = (-travel - transform.up * 0.22f).normalized;
+            Vector3 sparkUp = Vector3.Cross(transform.right, sparkDirection).normalized;
+            if (sparkUp.sqrMagnitude < 0.01f) sparkUp = transform.up;
+            shoeSparksObject.transform.SetPositionAndRotation(contact,
+                Quaternion.LookRotation(sparkDirection, sparkUp));
+            int count = slideSpeed > 2f ? 2 : 1;
+            for (int i = 0; i < shoeSparks.Length; i++)
+            {
+                ParticleSystem system = shoeSparks[i];
+                if (system == null) continue;
+                system.Emit(count);
+            }
+        }
+
+        private bool EnsureFrictionSparks()
+        {
+            if (shoeSparksObject != null && shoeSparks != null && shoeSparks.Length > 0) return true;
+            if (!wheelSparksPrefabAttempted)
+            {
+                wheelSparksPrefabAttempted = true;
+                try
+                {
+                    wheelSparksPrefab = Resources.Load("WheelslipSparks", typeof(GameObject)) as GameObject;
+                    if (wheelSparksPrefab == null) Main.Log("Wheel spark prefab not found; shoe sparks disabled.");
+                }
+                catch (Exception ex) { Main.Log("Wheel spark prefab load failed: " + ex.Message); }
+            }
+            if (wheelSparksPrefab == null) return false;
+            try
+            {
+                shoeSparksObject = UnityEngine.Object.Instantiate(wheelSparksPrefab, transform, false);
+                shoeSparksObject.name = "RailwayBrakeShoe_WheelSparks";
+                shoeSparks = shoeSparksObject.GetComponentsInChildren<ParticleSystem>(true);
+                for (int i = 0; i < shoeSparks.Length; i++)
+                    if (shoeSparks[i] != null) shoeSparks[i].Stop(true);
+                if (shoeSparks.Length == 0)
+                {
+                    UnityEngine.Object.Destroy(shoeSparksObject);
+                    shoeSparksObject = null;
+                    return false;
+                }
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Main.Log("Wheel spark instance creation failed: " + ex.Message);
+                shoeSparksObject = null;
+                shoeSparks = null;
+                return false;
+            }
+        }
+
+        private void StopFrictionSparks()
+        {
+            nextSparkTime = 0f;
+            if (shoeSparks == null) return;
+            for (int i = 0; i < shoeSparks.Length; i++)
+                if (shoeSparks[i] != null) shoeSparks[i].Stop(true);
+        }
+
+        /// <summary>
         /// The radius of the wheels on a car, in metres. Read from the livery's
         /// parent type, which is where TrainCar.Awake itself gets the figure it
         /// hands to WheelRotationBase, so a shoe under a locomotive uses the
@@ -2390,6 +2925,9 @@ namespace RailwayBrakeShoe
             // friction loop running.
             isScraping = false;
             slideSpeed = 0f;
+            // Same discipline for the contact flag: cleared here and set once the
+            // reach test below has actually been passed.
+            wheelTouching = false;
 
             Bogie bogie;
             double axleSpan;
@@ -2462,10 +3000,17 @@ namespace RailwayBrakeShoe
                 return;
             }
 
+            // Past the reach test above, so this wheel is on the shoe rather than
+            // approaching it. Only from here may the hazard layer roll against it.
+            wheelTouching = true;
+
             float bogieSpeed = 0f;
             if (bogie.rb != null)
                 bogieSpeed = Vector3.Dot(bogie.rb.velocity, bogie.transform.forward);
             float speed = Mathf.Abs(bogieSpeed);
+
+            // v1.2.0: Store the bogie speed for hazard checks.
+            lastBogieSpeed = bogieSpeed;
 
             // bogie.transform.forward is traveller.worldForward * trackDirection
             // (Bogie.UpdateRotation), so this is the sign of the wheel's motion
@@ -2484,6 +3029,24 @@ namespace RailwayBrakeShoe
                 wheelStopped = true;
             }
             bool moving = !wheelStopped;
+
+            // A shoe wedged in a frog has stopped being a wedge under a wheel and
+            // become an obstacle fixed in the crossing. It is not dragged along and
+            // it produces no braking force, so engagement ends here - but only
+            // after the contact and speed above, which the hazard layer reads.
+            //
+            // Placed ahead of the latches below so a jammed shoe cannot re-capture
+            // an offset from the next wheel to arrive and be carried out of the
+            // frog it is supposed to be stuck in.
+            if (jammedInFrog)
+            {
+                hasCapturedOffset = false;
+                offsetLocked = false;
+                contactFromBehind = false;
+                pushSpanDirection = 0.0;
+                State = ShoeState.InitialContact;
+                return;
+            }
 
             // Which face of the shoe this wheel met. Latched on first contact and
             // held while the wheel stays in reach, so a wheel that arrived at the
@@ -2521,15 +3084,22 @@ namespace RailwayBrakeShoe
                 // rate: the first term lets the shoe keep up exactly with a wheel
                 // under power, so it is never overrun, and the second clears an
                 // overlap under a standing wheel gently enough to read as a shove.
+                // Route this bounded move through the same shoe-to-shoe swept
+                // contact path as the normal working-surface follow. The wrong-way
+                // branch used to write railSpan directly, which let a kinematic
+                // shoe carried by a wheel pass through another anchored shoe.
                 double maxStep = (speed + DepenetrationSpeed) * Time.fixedDeltaTime;
                 // The shoe is shoved away from the wheel, and the wheel is on the
                 // stop-block side, so that is the direction opposite the shoe's own
                 // working direction - not along it.
+                double targetSpan = railSpan;
                 if (workDirection < 0.0)
                 {
-                    if (pushedSpan > railSpan) railSpan = Math.Min(pushedSpan, railSpan + maxStep);
+                    if (pushedSpan > railSpan) targetSpan = Math.Min(pushedSpan, railSpan + maxStep);
                 }
-                else if (pushedSpan < railSpan) railSpan = Math.Max(pushedSpan, railSpan - maxStep);
+                else if (pushedSpan < railSpan) targetSpan = Math.Max(pushedSpan, railSpan - maxStep);
+                if (Math.Abs(targetSpan - railSpan) > 1e-7)
+                    MoveWithShoeContacts(targetSpan, speed, new HashSet<BrakeShoeBehaviour>());
                 // Not Braking: nothing is being braked. The wheel is touching the
                 // shoe, which is what InitialContact means, and keeping it out of
                 // the rolling states also leaves the shoe pickable.
@@ -2573,19 +3143,16 @@ namespace RailwayBrakeShoe
             // If the wheel reverses off the shoe, the shoe stays where it is and
             // the wheel simply rolls away from it, as a real shoe would.
             double followSpan = axleSpan - capturedSpanOffset;
-            if (pushSpanDirection > 0.0)
-            {
-                if (followSpan > railSpan) railSpan = followSpan;
-            }
-            else if (pushSpanDirection < 0.0)
-            {
-                if (followSpan < railSpan) railSpan = followSpan;
-            }
 
             if (wheelStopped)
             {
-                State = ShoeState.Braking;
-                return;
+                if (TryHoldStoppedWheel(bogie, speed, workDirection))
+                {
+                    State = ShoeState.Braking;
+                    return;
+                }
+                // Capacity is insufficient for the current grade. Continue
+                // through the sliding path so the shoe slips with the wheel.
             }
 
             // A wedge only resists the direction it is driven. Once the wheel
@@ -2607,6 +3174,17 @@ namespace RailwayBrakeShoe
                 return;
             }
 
+            // Only now, after all direction checks pass, does the shoe follow the
+            // wheel. Sweep the actual compound colliders through the full movement
+            // interval, stopping at contact and recursively pushing loose shoes.
+            double proposedSpan = followSpan;
+            if (Math.Abs(proposedSpan - railSpan) > 1e-7)
+            {
+                MoveWithShoeContacts(proposedSpan, speed, new HashSet<BrakeShoeBehaviour>());
+                proposedSpan = railSpan;
+            }
+            railSpan = proposedSpan;
+
             State = ShoeState.Sliding;
 
             // From here the shoe is being dragged along the railhead: that is the
@@ -2622,7 +3200,15 @@ namespace RailwayBrakeShoe
             float mu = Main.Config.DryFriction * Mathf.Lerp(1f, Main.Config.WetFrictionMultiplier, wetness);
             float load = GetAxleLoad(bogie);
             float speedFactor = Mathf.Lerp(0.45f, 1f, Mathf.Clamp01(speed / 5f));
+
+            // The friction model, unchanged from 1.1.0.
             float requested = Mathf.Min(Main.Config.MaximumBrakeForce, mu * load * speedFactor);
+
+            // At crawl speed use the car's own full handbrake capacity as the
+            // reference. This keeps the shoe equivalent across light and heavy
+            // cars and avoids a fixed force that is wrong on steep grades.
+            if (speed < 0.5f)
+                requested = Mathf.Max(requested, GetHoldingCapacity(contactCar));
 
             int active = CountActiveShoes(contactCar);
             requested *= Mathf.Pow(0.92f, Mathf.Max(0, active - 1));
@@ -2648,12 +3234,354 @@ namespace RailwayBrakeShoe
         }
 
         /// <summary>
+        /// The hazard layer, run after engagement has settled this step's state.
+        ///
+        /// Deliberately a reader of that state and never a writer of it: nothing
+        /// here changes a span, an offset or a contact latch, so the braking
+        /// physics behaves exactly as it did without this method. The one thing it
+        /// does write is <see cref="jammedInFrog"/>, which the follow code checks.
+        ///
+        /// Both hazards are rolled on a timer for as long as the dangerous contact
+        /// lasts, rather than once when it starts. A wheel grinding against the
+        /// back of a shoe is in continuing danger, and one roll at the moment of
+        /// touch would make the outcome a property of that instant.
+        /// </summary>
+        private void UpdateHazards()
+        {
+            if (!IsAnchored)
+            {
+                ResetHazardTimer();
+                return;
+            }
+
+            // Jammed shoes are their own hazard and are handled first: once
+            // jammed the shoe is an obstacle in the frog, not a brake, and the
+            // wrong-way test below no longer describes it.
+            if (jammedInFrog)
+            {
+                UpdateJammedFrogHazard();
+                return;
+            }
+
+            if (TryJamInFrog()) return;
+
+            // One unified speed event. It is sampled once per wheel contact and
+            // is inactive through 25 km/h. The shoe drop and bogie derailment
+            // rolls are independent outcomes of the same speed band.
+            if (Main.Config.SpeedHazardEnabled && wheelTouching && contactBogie != null &&
+                contactCar != null && !wheelStopped && !highSpeedRolled)
+            {
+                float speed = Mathf.Abs(lastBogieSpeed);
+                float speedKmh = speed * 3.6f;
+                float dropChance = ShoeRules.SpeedDropChance(speedKmh);
+                float derailChance = ShoeRules.SpeedDerailChance(speedKmh);
+                if (dropChance > 0f || derailChance > 0f)
+                {
+                    // Do not consume the one-shot latch below the 25 km/h
+                    // activation threshold; a contact that accelerates later
+                    // must receive its speed event when it crosses the limit.
+                    highSpeedRolled = true;
+                    bool derailed = Roll(derailChance);
+                    if (derailed)
+                    {
+                        Main.LogAlways("Derailing " + DescribeCar(contactCar) + ": brake shoe strike at " + speedKmh.ToString("0.0") + " km/h");
+                        DerailBogie(contactBogie, "struck a brake shoe at speed");
+                    }
+                    if (Roll(dropChance)) EjectFromRail(speed);
+                    if (derailed || !IsAnchored) return;
+                }
+            }
+
+            // A wheel up against the back of the end stop. The shoe is being
+            // shoved along the railhead ahead of it and is under the wheel's
+            // flange rather than beneath its tread, which is the case that
+            // picks a wheel off the rail.
+            if (contactFromBehind && wheelTouching && contactBogie != null && contactCar != null)
+            {
+                if (!Main.Config.WrongShoeDerailEnabled)
+                {
+                    ResetHazardTimer();
+                    return;
+                }
+                // A shoe being shoved by a standing wheel is not yet a hazard;
+                // it is the movement over it that lifts the wheel.
+                if (wheelStopped)
+                {
+                    ResetHazardTimer();
+                    return;
+                }
+                // The unified speed table owns extra derailment/drop risk below
+                // 25 km/h: a wrong-way contact at shunting speed must not add a
+                // second random derailment event.
+                if (Mathf.Abs(lastBogieSpeed) * 3.6f <= 25f)
+                {
+                    ResetHazardTimer();
+                    return;
+                }
+                if (!HazardCheckDue(contactCar)) return;
+                if (!Roll(Main.Config.WrongShoeDerailChance)) return;
+
+                Main.LogAlways("Derailing " + DescribeCar(contactCar) + ": wheel riding a brake shoe placed the wrong way round.");
+                DerailBogie(contactBogie, "hit a brake shoe placed the wrong way round");
+                // v1.2.0: Eject the shoe after derailment.
+                EjectFromRail(Mathf.Abs(lastBogieSpeed));
+                return;
+            }
+
+            ResetHazardTimer();
+        }
+
+        /// <summary>
+        /// Rolls for the shoe wedging in a switch frog while a wheel is dragging
+        /// it along. Returns true when it jammed on this step.
+        ///
+        /// Only a shoe actually being carried is a candidate: a shoe placed by
+        /// hand inside a frog is where the player put it and is left alone. The
+        /// roll is made once per approach, not per step, so crossing a switch is
+        /// one chance rather than fifty.
+        /// </summary>
+        private bool TryJamInFrog()
+        {
+            // Being dragged means the wedge is engaged and the wheel is moving,
+            // which is exactly the Sliding/Breakaway pair.
+            bool dragged = offsetLocked && (State == ShoeState.Sliding || State == ShoeState.Breakaway);
+            if (!dragged)
+            {
+                frogJamRolled = false;
+                return false;
+            }
+
+            string junctionName;
+            if (!IsInFrogWindow(out junctionName))
+            {
+                // Clear of the switch again, so the next one gets its own roll.
+                frogJamRolled = false;
+                return false;
+            }
+
+            // Diagnostic: log when the shoe enters the frog window while being dragged.
+            if (!frogJamRolled)
+            {
+                Main.Log("Shoe being dragged through frog window at " + (junctionName ?? "a switch") + " (span: " + railSpan.ToString("0.00") + " m, state: " + State + "). Jamming shoe.");
+            }
+
+            if (frogJamRolled) return false;
+            frogJamRolled = true;
+            jammedInFrog = true;
+            jammedJunctionName = junctionName;
+            jammedRolledBogie = null;
+            // The wedge is given up here: a jammed shoe stops following the wheel
+            // that was pushing it. Clearing the offset is what the follow code in
+            // UpdateWheelEngagement reads, and it is the one write this layer
+            // makes into engagement state.
+            offsetLocked = false;
+            pushSpanDirection = 0.0;
+            ResetHazardTimer();
+            Main.LogAlways("Brake shoe jammed in the frog at " + (junctionName ?? "a switch") + ".");
+            return true;
+        }
+
+        /// <summary>
+        /// Rolls against each axle passing over a shoe already jammed in a frog.
+        ///
+        /// v1.2.0: One-shot check at first contact, like high-speed collision.
+        /// The shoe is a lump of steel in the crossing, so any wheel reaching it
+        /// while moving is at immediate risk of derailment.
+        /// </summary>
+        private void UpdateJammedFrogHazard()
+        {
+            // wheelTouching, not just contactBogie: the axle search reaches three
+            // metres up the track so an approach can be seen coming, and a wheel
+            // still that far off has not struck the jammed shoe yet.
+            if (!wheelTouching || contactBogie == null || contactCar == null || wheelStopped)
+            {
+                if (contactBogie == null || !wheelTouching) jammedRolledBogie = null;
+                return;
+            }
+
+            // One-shot per bogie: once it's rolled for this axle, that's final.
+            if (jammedRolledBogie == contactBogie) return;
+            jammedRolledBogie = contactBogie;
+
+            // Every bogie gets its own independent 50% roll.
+            if (!Roll(0.5f)) return;
+
+            Main.LogAlways("Derailing " + DescribeCar(contactCar) + ": wheel struck a brake shoe jammed in " + (jammedJunctionName ?? "a frog") + ".");
+            DerailBogie(contactBogie, "struck a brake shoe jammed in a switch frog");
+            // v1.2.0: Eject the jammed shoe after being struck.
+            EjectFromRail(Mathf.Abs(lastBogieSpeed));
+        }
+
+        /// <summary>
+        /// Whether the shoe currently sits within the frog window of a junction at
+        /// either end of its own track, and the name of that junction.
+        ///
+        /// The node is the end of the point set, so this is a span comparison
+        /// against 0 and the track's length. Only a track that genuinely ends at a
+        /// Junction counts: a plain joint between two tracks has no crossing
+        /// casting to catch a shoe.
+        /// </summary>
+        private bool IsInFrogWindow(out string junctionName)
+        {
+            junctionName = null;
+            if (currentTrack == null) return false;
+
+            double total;
+            if (!RailPlacement.TryGetTrackSpan(currentTrack, out total)) return false;
+
+            try
+            {
+                if (railSpan <= FrogWindowHalfLength && currentTrack.inJunction != null &&
+                    IsConflictingTurnoutRoute(currentTrack.inJunction, currentTrack))
+                {
+                    junctionName = currentTrack.inJunction.name;
+                    return true;
+                }
+                if (railSpan >= total - FrogWindowHalfLength && currentTrack.outJunction != null &&
+                    IsConflictingTurnoutRoute(currentTrack.outJunction, currentTrack))
+                {
+                    junctionName = currentTrack.outJunction.name;
+                    return true;
+                }
+            }
+            catch (Exception ex)
+            {
+                Main.Log("Junction lookup for the frog window failed: " + ex.Message);
+            }
+            return false;
+        }
+
+        // A frog window is only hazardous for an approach from an unselected
+        // turnout branch. The Junction object already exposes the authoritative
+        // selectedBranch and outBranches list; using them keeps a correctly
+        // routed shoe from receiving a distance-only frog event.
+        private static bool IsConflictingTurnoutRoute(Junction junction, RailTrack track)
+        {
+            if (junction == null || track == null || junction.outBranches == null) return false;
+            for (int i = 0; i < junction.outBranches.Count; i++)
+            {
+                Junction.Branch branch = junction.outBranches[i];
+                if (branch != null && branch.track == track)
+                    return i != junction.selectedBranch;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Whether a hazard roll is due for this car, restarting the countdown when
+        /// the car in contact changes. Returns true at most once per interval and
+        /// arms the next one.
+        /// </summary>
+        private bool HazardCheckDue(TrainCar car)
+        {
+            float interval = Mathf.Max(0.5f, Main.Config.HazardCheckInterval);
+            if (hazardContactCar != car)
+            {
+                hazardContactCar = car;
+                nextHazardCheck = Time.time + interval;
+                return false;
+            }
+            if (nextHazardCheck <= 0f)
+            {
+                nextHazardCheck = Time.time + interval;
+                return false;
+            }
+            if (Time.time < nextHazardCheck) return false;
+            nextHazardCheck = Time.time + interval;
+            return true;
+        }
+
+        /// <summary>
+        /// Drops the countdown so the next dangerous contact waits a full interval
+        /// before its first roll instead of being rolled against on contact.
+        /// </summary>
+        private void ResetHazardTimer()
+        {
+            nextHazardCheck = 0f;
+            hazardContactCar = null;
+        }
+
+        private static bool Roll(float chance)
+        {
+            if (chance <= 0f) return false;
+            if (chance >= 1f) return true;
+            return UnityEngine.Random.value < chance;
+        }
+
+        /// <summary>
+        /// Derails one bogie through the game's own entry point.
+        ///
+        /// Bogie.Derail is what the game's SafetyDerailer and the traveller code
+        /// call, and it opens by returning if the bogie has already derailed, so a
+        /// second roll landing on the same bogie is harmless. callDerailOnOtherBogies
+        /// is false: one axle picked off the rail by a shoe should take that bogie,
+        /// not lift the whole consist at once.
+        /// </summary>
+        private void DerailBogie(Bogie bogie, string message)
+        {
+            try
+            {
+                if (bogie == null || bogie.HasDerailed) return;
+                bogie.Derail(message, false, false);
+            }
+            catch (Exception ex)
+            {
+                Main.Entry.Logger.Warning("Derail call failed: " + ex.Message);
+            }
+        }
+
+        private static string DescribeCar(TrainCar car)
+        {
+            if (car == null) return "a car";
+            try { return car.ID ?? car.name; }
+            catch { return "a car"; }
+        }
+
+        /// <summary>
+        /// v1.2.0: Ejects the shoe from the rail with a lateral impulse, simulating
+        /// being knocked off by a wheel. The impulse is scaled by the collision speed
+        /// so a gentle bump produces a small slide while a high-speed strike sends
+        /// the shoe tumbling clear.
+        /// </summary>
+        private void EjectFromRail(float collisionSpeed)
+        {
+            if (!IsAnchored) return;
+
+            // Detach first so the shoe becomes a dynamic body again.
+            DetachFromRail("knocked off by wheel impact");
+
+            if (body == null) return;
+
+            try
+            {
+                // Lateral direction: perpendicular to the rail, away from the track centre.
+                Vector3 lateral = transform.right * railSide;
+                // Small upward component so the shoe doesn't just slide flat.
+                Vector3 up = Vector3.up * 0.15f;
+
+                // Scale impulse by collision speed, clamped to config range.
+                float speedFactor = Mathf.Clamp01(collisionSpeed / 20f);
+                float impulse = Mathf.Lerp(Main.Config.EjectionImpulseMin, Main.Config.EjectionImpulseMax, speedFactor);
+
+                Vector3 direction = (lateral + up).normalized;
+                body.AddForce(direction * impulse * body.mass, ForceMode.Impulse);
+
+                Main.LogAlways("Brake shoe ejected from rail (speed: " + (collisionSpeed * 3.6f).ToString("0.0") + " km/h, impulse: " + impulse.ToString("0.0") + " m/s)");
+            }
+            catch (Exception ex)
+            {
+                Main.Log("Ejection failed: " + ex.Message);
+            }
+        }
+
+        /// <summary>
         /// Drops everything remembered about the wheel currently on the shoe,
         /// including which way the wedge was being driven, so the next wheel
         /// starts from a clean state.
         /// </summary>
         private void ClearEngagement()
         {
+            ReleaseStaticHold();
             contactBogie = null;
             contactCar = null;
             hasCapturedOffset = false;
@@ -2665,6 +3593,20 @@ namespace RailwayBrakeShoe
             // counted as stopped and be held there until it passed the higher
             // release threshold.
             wheelStopped = false;
+            // Facts about one wheel, so they go with it. jammedInFrog is not
+            // cleared here: the shoe stays wedged in the crossing after the wheel
+            // that was on it has gone, and it is only freed by being picked up.
+            //
+            // wheelTouching is cleared at the top of every engagement step anyway;
+            // it is repeated here for the paths that clear engagement without one,
+            // so a detached shoe cannot be left reporting a stale contact.
+            wheelTouching = false;
+            ResetHazardTimer();
+            jammedRolledBogie = null;
+            frogJamRolled = false;
+            // v1.2.0: Reset high-speed flag so the next wheel gets its own roll.
+            highSpeedRolled = false;
+            lastBogieSpeed = 0f;
         }
 
         /// <summary>
@@ -2691,10 +3633,69 @@ namespace RailwayBrakeShoe
         }
 
         /// <summary>
+        /// v1.2.0: Calculates the additional force component needed to resist a car
+        /// sliding down a slope due to gravity. This is added on top of the base
+        /// friction model, not replacing it.
+        ///
+        /// Uses the bogie's forward vector to determine track grade. The Y component
+        /// is sin(angle), which gives the fraction of gravitational force pulling
+        /// the car down the slope.
+        ///
+        /// Returns the force per shoe, already divided by the number of active shoes
+        /// on this car.
+        /// </summary>
+        private float GetSlopeForceComponent(Bogie bogie, TrainCar car)
+        {
+            if (car == null || bogie == null) return 0f;
+
+            try
+            {
+                // Total mass of the car including cargo.
+                float totalMass = car.rb != null ? car.rb.mass : 1000f;
+                float gravity = Mathf.Abs(Physics.gravity.y);
+
+                // The bogie's forward vector points along the track. Its Y component
+                // is the sine of the track's grade angle.
+                Vector3 trackForward = bogie.transform.forward;
+                float sinAngle = Mathf.Abs(trackForward.y);
+
+                // F_slope = m * g * sin(angle)
+                float totalSlopeForce = totalMass * gravity * sinAngle;
+
+                // Distribute across all shoes on this car.
+                int activeShoes = CountActiveShoes(car);
+                float perShoe = totalSlopeForce / Mathf.Max(1, activeShoes);
+
+                return perShoe;
+            }
+            catch (Exception ex)
+            {
+                Main.Log("GetSlopeForceComponent failed: " + ex.Message);
+                return 0f;
+            }
+        }
+
+        /// <summary>
         /// Scans the bogies registered on the shoe's track and returns the axle
         /// closest to the shoe in span space, together with its span.
         /// </summary>
         private bool TryFindEngagedAxle(out Bogie bogie, out double axleSpan, out float direction)
+        {
+            return TryFindEngagedAxle(null, out bogie, out axleSpan, out direction);
+        }
+
+        /// <summary>
+        /// Finds the nearest axle, optionally restricted to one exact wagon.
+        /// The unrestricted form is retained for the physics and placement
+        /// callers; job validation uses the restricted form so another nearby
+        /// wagon cannot win the nearest-axle race.
+        /// </summary>
+        private bool TryFindEngagedAxle(TrainCar requiredCar, out Bogie bogie, out double axleSpan, out float direction)
+        {
+            return TryFindEngagedAxle(requiredCar, Main.Config.CaptureHalfLength + 3.0, out bogie, out axleSpan, out direction);
+        }
+
+        private bool TryFindEngagedAxle(TrainCar requiredCar, double searchRadius, out Bogie bogie, out double axleSpan, out float direction)
         {
             bogie = null;
             axleSpan = 0.0;
@@ -2702,7 +3703,7 @@ namespace RailwayBrakeShoe
 
             // Only wheels within this distance are considered at all; beyond it
             // the shoe is simply parked on the rail.
-            double reach = Main.Config.CaptureHalfLength + 3.0;
+            double reach = Math.Max(0.01, searchRadius);
             double bestDistance = reach;
             bool found = false;
 
@@ -2726,6 +3727,7 @@ namespace RailwayBrakeShoe
                     if (candidate == null || candidate.HasDerailed) continue;
                     if (candidate.track != map.Track) continue;
                     if (candidate.traveller == null) continue;
+                    if (requiredCar != null && candidate.Car != requiredCar) continue;
 
                     double bogieSpan;
                     try { bogieSpan = candidate.traveller.Span; }
@@ -3025,7 +4027,10 @@ namespace RailwayBrakeShoe
             // anchor that was just established and drop the shoe through the
             // rail.
             if (IsInPlacementGrace()) return;
-            if (snappedToRail || currentTrack != null) DetachFromRail("grabbed by the player");
+            if (snappedToRail || currentTrack != null)
+            {
+                DetachFromRail("grabbed by the player");
+            }
         }
 
         /// <summary>
@@ -3079,6 +4084,34 @@ namespace RailwayBrakeShoe
             return placementGraceUntil > 0f && Time.time <= placementGraceUntil;
         }
 
+        /// <summary>
+        /// v1.2.0: Finds another brake shoe ahead of this one on the same track,
+        /// in the direction of travel. Used for shoe-to-shoe collision detection.
+        /// </summary>
+        private BrakeShoeBehaviour FindBlockingShoe(double proposedSpan, double travelDirection)
+        {
+            if (currentTrack == null || travelDirection == 0.0) return null;
+
+            // Search window: a few metres ahead in the direction of travel.
+            double searchDistance = 2.0; // metres
+            double searchSpan = proposedSpan + (searchDistance * travelDirection);
+
+            foreach (BrakeShoeBehaviour other in Main.Shoes)
+            {
+                if (other == null || other == this) continue;
+                if (!other.IsAnchored || other.currentTrack != currentTrack) continue;
+
+                // Check if the other shoe is ahead of us in the direction of travel.
+                double delta = (other.railSpan - proposedSpan) * travelDirection;
+                if (delta > 0 && delta < searchDistance)
+                {
+                    return other;
+                }
+            }
+
+            return null;
+        }
+
         private static int CountActiveShoes(TrainCar car)
         {
             if (activeShoeCountFrame != Time.frameCount)
@@ -3105,12 +4138,6 @@ namespace RailwayBrakeShoe
             return !float.IsNaN(value.x) && !float.IsInfinity(value.x) && !float.IsNaN(value.y) && !float.IsInfinity(value.y) && !float.IsNaN(value.z) && !float.IsInfinity(value.z);
         }
 
-        internal void DrawDebug()
-        {
-            Color color = State == ShoeState.Braking ? Color.red : State == ShoeState.Breakaway ? Color.yellow : Color.cyan;
-            Debug.DrawRay(contactPoint, transform.up * 0.5f, color, 0.05f, false);
-            Debug.DrawRay(contactPoint, lastForce * 0.00001f, Color.magenta, 0.05f, false);
-        }
     }
 
     internal static class RailPlacement
@@ -3243,10 +4270,12 @@ namespace RailwayBrakeShoe
 
         /// <summary>
         /// Full hierarchy path of a track's GameObject, "root/child/.../track".
-        /// This is the identifier the game itself uses to tell tracks apart:
-        /// RailTrackRegistryBase.TracksHash is an MD5 over exactly this string
-        /// for every track (verified in its IL, via GameObjectUtils.GetPath).
-        /// Unlike a name it is unique, which is what a saved anchor needs.
+        /// The game includes these strings in RailTrackRegistryBase.TracksHash
+        /// (via GameObjectUtils.GetPath), but that layout hash does not provide
+        /// a unique identifier for each track.
+        /// Paths are not unique: turntables and repeated junction prefabs can
+        /// have identically named siblings. FindTrack also uses the saved item
+        /// position to disambiguate those paths.
         /// </summary>
         internal static string GetTrackPath(RailTrack track)
         {
@@ -3276,18 +4305,13 @@ namespace RailwayBrakeShoe
         /// <summary>
         /// Resolves the track a saved shoe was anchored to.
         ///
-        /// Three keys, in decreasing order of trust: the hierarchy path, then the
-        /// shoe's restored position, then the bare name. The position is what
-        /// makes a turntable work. Ordinary tracks are named uniquely in this game
-        /// ("[Y]_[CS]_[M-07-P]"), which is why shoes off a turntable always came
-        /// back, but every turntable calls its RailTrack "Turntable Track" - the
-        /// name occurs eleven times in level520 alone. A save written before the
-        /// path was stored therefore carries an ambiguous name, and refusing it
-        /// outright left the shoe with no anchor at all: rails have no colliders,
-        /// so it sank and was later collected into lost and found. Exactly the
-        /// reported disappearance. The game restores an item's transform before
-        /// the load callback runs, so asking which track the shoe is standing on
-        /// settles the ambiguity with the shoe's own geometry.
+        /// Prefer the saved hierarchy, using position when several tracks have
+        /// that path. In level520 all eleven turntable tracks are siblings named
+        /// "[railway]/Turntable Track"; many junction paths repeat too. Returning
+        /// the first path match therefore moved shoes to another station. The
+        /// game's item loader restores world position before the load callback,
+        /// and the turntables' point sets have already been rotated to their
+        /// saved angles, so geometry resolves the correct member of that group.
         /// </summary>
         internal static RailTrack FindTrack(string trackPath, string trackName, Vector3 position)
         {
@@ -3298,15 +4322,26 @@ namespace RailwayBrakeShoe
 
                 if (!string.IsNullOrEmpty(trackPath))
                 {
+                    List<RailTrack> pathMatches = new List<RailTrack>();
                     for (int i = 0; i < all.Length; i++)
                     {
                         if (all[i] == null) continue;
-                        if (GetTrackPath(all[i]) == trackPath) return all[i];
+                        if (GetTrackPath(all[i]) == trackPath) pathMatches.Add(all[i]);
                     }
-                    // The path is a snapshot of the hierarchy. A turntable rotates
-                    // its own transform, and world streaming rebuilds objects, so a
-                    // path can stop matching while the track itself is still there.
-                    // Fall through to the position rather than dropping the anchor.
+                    if (pathMatches.Count == 1) return pathMatches[0];
+                    if (pathMatches.Count > 1)
+                    {
+                        RailTrack resolved = FindTrackByPosition(pathMatches.ToArray(), null, position);
+                        if (resolved == null)
+                            Main.Log("Saved track path is shared by " + pathMatches.Count +
+                                " tracks, but none is near the saved shoe position: " + trackPath);
+                        // An unresolved duplicate remains a pending restore. Do
+                        // not apply its saved span to an unrelated name match.
+                        return resolved;
+                    }
+                    // Reparenting can change a path, but rotating a turntable
+                    // does not. Older saves still have name and position as a
+                    // fallback when the hierarchy no longer matches.
                     Main.Log("Saved track path did not resolve, falling back to position: " + trackPath);
                 }
 
@@ -3361,10 +4396,11 @@ namespace RailwayBrakeShoe
                 for (int i = 0; i < all.Length; i++)
                     if (all[i] != null && all[i].name == trackName) candidates.Add(all[i]);
             }
-            // No name saved, or the name matches nothing in this scene: fall back to
-            // the whole map. Generating point sets for every track is expensive, but
-            // this runs once per saved shoe at world load, not per frame.
-            if (candidates.Count == 0)
+            // A saved name that is absent means the target is not available yet.
+            // Choosing a neighbouring track would reuse the saved span on the
+            // wrong geometry. A null result lets the existing restore retry wait.
+            if (!string.IsNullOrEmpty(trackName) && candidates.Count == 0) return null;
+            if (string.IsNullOrEmpty(trackName))
             {
                 for (int i = 0; i < all.Length; i++)
                     if (all[i] != null) candidates.Add(all[i]);

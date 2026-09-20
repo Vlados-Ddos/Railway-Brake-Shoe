@@ -6,14 +6,20 @@
 
 Railway Brake Shoe adds a functional railway brake shoe to Derail Valley.
 
-The brake shoe can be purchased from shops, picked up and placed directly on the rail. It interacts with rolling stock and provides braking resistance based on the wagon's movement, axle load, speed, number of brake shoes and rail conditions.
+The brake shoe can be purchased from shops, picked up, and placed directly on the rail. It interacts with rolling stock and provides braking resistance based on the wagon's movement, axle load, speed, the number of brake shoes, and rail conditions.
 
-The brake shoe follows the rail and works on both sides of the track and in either direction.
+The brake shoe follows the rail and works on either side of the track and in either direction.
+
+### Support
+
+Enjoy my Derail Valley mods? You can support my work on Ko-fi!
+
+[**Support me on Ko-fi**](https://ko-fi.com/7vlad7)
 
 ### Installation instructions
 
-1. Install custom_item_mod
-2. Install the mod through UMM.
+1. Install [**custom_item_mod**](https://www.nexusmods.com/derailvalley/mods/891).
+2. Install the mod through [**UMM**](https://www.nexusmods.com/site/mods/21).
 
 ### Main features
 
@@ -24,13 +30,13 @@ The brake shoe follows the rail and works on both sides of the track and in eith
 - Two possible directions along the rail.
 - Rotate between directions using the mouse wheel while placing.
 - Brake shoe physically engages with approaching wheels.
-- Braking starts after the wheel engages with the shoe.
-- Braking resistance depends on axle load, speed and rail conditions.
+- Braking starts after a wheel engages with the shoe.
+- Braking resistance depends on axle load, speed, and rail conditions.
 - Supports multiple brake shoes.
 - Multiple brake shoes can physically interact and push each other.
 - Brake shoe can slide along the rail when the applied load becomes excessive.
 - Dry and wet rail conditions affect braking force.
-- Follows rails through curves, grades, switches and track joints.
+- Follows rails through curves, grades, switches, and track joints.
 - Route-aware behavior through switches and frogs.
 - Pickup and repositioning support.
 - Placement and sliding sounds.
@@ -44,15 +50,18 @@ The brake shoe follows the rail and works on both sides of the track and in eith
 - Brake shoes placed on turntables are restored correctly.
 - Supports a large number of placed brake shoes.
 - 100 brake shoes are available for purchase in total across all shops.
+- Automatic Service Shoes.
 
 ### Compatibility
 
 - **ShopRework:** Fully compatible.
-- **Multiplayer:** Multiplayer compatibility will be added after synchronization for gadgets and items is added to Multiplayer.
+- **CareerRework:** Fully compatible.
+- **Passenger Jobs:** Fully compatible.
+- **Multiplayer:** Multiplayer compatibility will be added once synchronization for gadgets and items is implemented in Multiplayer.
 
-### Shout outs
+### Shout-outs
 
-Special thanks to my wonderful friend **dardayy** for the original idea and for helping me bring this project to life.
+Special thanks to my great friend **dardayy** for the original idea and for helping me bring this project to life.
 
 ---
 
@@ -62,50 +71,59 @@ Special thanks to my wonderful friend **dardayy** for the original idea and for 
 
 Railway Brake Shoe добавляет в Derail Valley функциональный железнодорожный тормозной башмак.
 
-Башмак можно приобрести в магазинах, взять в руки и установить непосредственно на рельс. Он взаимодействует с подвижным составом и создаёт тормозное сопротивление в зависимости от движения вагона, осевой нагрузки, скорости, количества башмаков и состояния рельса.
+Башмак можно приобрести в магазинах, взять в руки и установить непосредственно на рельс. Он взаимодействует с подвижным составом и создаёт тормозное сопротивление, зависящее от движения вагона, осевой нагрузки, скорости, количества установленных башмаков и состояния рельсов.
 
-Башмак следует по рельсу и работает с обеих сторон пути и в обоих направлениях.
+Башмак следует вдоль рельса и работает с обеих сторон пути, в обоих направлениях движения.
+
+### Поддержка
+
+Нравятся мои моды для Derail Valley? Вы можете поддержать мою работу на Ko-fi!
+
+[**Поддержать меня на Ko-fi**](https://ko-fi.com/7vlad7)
 
 ### Установка
 
-1. Установите custom_item_mod.
-2. Установите мод через UMM.
+1. Установите [**custom_item_mod**](https://www.nexusmods.com/derailvalley/mods/891).
+2. Установите мод через [**UMM**](https://www.nexusmods.com/site/mods/21).
 
 ### Основные возможности
 
-- Функциональный физический железнодорожный тормозной башмак.
-- Установка непосредственно на рельсы.
-- Установка только на рельсы.
+- Полноценный физический железнодорожный тормозной башмак.
+- Установка башмака непосредственно на рельсы.
+- Устанавливать башмак можно только на рельсы.
 - Поддержка левого и правого рельса.
-- Два возможных направления вдоль рельса.
+- Два возможных направления установки вдоль рельса.
 - Переключение направления колёсиком мыши во время установки.
 - Физическое взаимодействие башмака с приближающимися колёсами.
-- Торможение начинается после зацепления колеса с башмаком.
-- Тормозное сопротивление зависит от осевой нагрузки, скорости и состояния рельса.
-- Поддержка нескольких тормозных башмаков.
+- Торможение начинается после контакта колеса с башмаком.
+- Тормозное сопротивление зависит от осевой нагрузки, скорости и состояния рельсов.
+- Возможность использовать несколько тормозных башмаков одновременно.
 - Несколько башмаков могут физически взаимодействовать и толкать друг друга.
-- Башмак может сдвигаться по рельсу при чрезмерной нагрузке.
-- Сухой и мокрый рельс влияют на силу торможения.
-- Работа на кривых, уклонах, стрелках и стыках путей.
-- Поведение на стрелках и в крестовинах зависит от выбранного маршрута.
-- Возможность поднимать и переставлять башмак.
-- Звуки установки и скольжения.
-- Реалистичные искры непосредственно в месте контакта башмака с рельсом при скольжении.
-- Настраиваемые параметры тормозной силы и трения.
-- Опциональное ослабление ручного тормоза.
+- При чрезмерной нагрузке башмак может скользить вдоль рельса.
+- Состояние рельсов — сухие или мокрые — влияет на силу торможения.
+- Башмак следует по рельсам на кривых, уклонах, стрелках и стыках.
+- Учитывается выбранный маршрут при прохождении стрелок и крестовин.
+- Башмак можно поднять и переставить.
+- Звуковые эффекты установки и скольжения.
+- Реалистичные искры возникают непосредственно в месте контакта башмака с рельсом при скольжении.
+- Настраиваемые параметры тормозного усилия и трения.
+- Возможность уменьшить эффективность ручного тормоза.
 - Башмак может заменить ручной тормоз при выполнении заданий.
-- Улучшено определение вагона и оси при проверке требований задания.
-- Динамическая система безопасности на скоростях выше 25 км/ч, включая выброс башмака и риск схода.
-- Установленные башмаки сохраняются после сохранения и загрузки игры.
-- Башмаки, установленные на поворотных кругах, корректно восстанавливают своё положение.
-- Поддержка большого количества установленных башмаков.
-- Всего во всех магазинах доступно для покупки 100 тормозных башмаков.
+- Улучшено определение вагонов и осей при проверке требований задания, связанных с тормозными башмаками.
+- Динамическое поведение на высоких скоростях (выше 25 км/ч), включая выброс башмака и риск схода подвижного состава с рельсов.
+- Установленные башмаки сохраняются при сохранении и последующей загрузке игры.
+- Башмаки, установленные на поворотных кругах, корректно восстанавливаются после загрузки.
+- Поддерживается большое количество одновременно установленных башмаков.
+- Во всех магазинах суммарно доступно для покупки 100 тормозных башмаков.
+- Автоматические служебные тормозные башмаки (Automatic Service Shoes).
 
 ### Совместимость
 
 - **ShopRework:** Полная совместимость.
-- **Мультиплеер:** Совместимость с мультиплеером будет добавлена после появления синхронизации гаджетов и предметов в мультиплеере.
+- **CareerRework:** Полная совместимость.
+- **Passenger Jobs:** Полная совместимость.
+- **Мультиплеер:** Совместимость с мультиплеером появится после реализации синхронизации гаджетов и предметов.
 
 ### Благодарности
 
-Отдельная благодарность моему замечательному другу **dardayy** за идею и помощь в реализации данного проекта.
+Особая благодарность моему замечательному другу **dardayy** за оригинальную идею и помощь в воплощении этого проекта.

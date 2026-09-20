@@ -1,8 +1,7 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
-using System.Reflection.Emit;
 using HarmonyLib;
 using Newtonsoft.Json.Linq;
 using UnityEngine;
@@ -65,6 +64,7 @@ namespace RailwayBrakeShoe
         // v1.2.0: Count brake shoes as handbrakes for job completion.
         public bool BrakeShoeCountsAsHandbrake = true;
         public bool DebugLogging = false;
+        public bool AutomaticServiceShoes = true;
 
         public override void Save(UnityModManager.ModEntry modEntry)
         {
@@ -91,7 +91,6 @@ namespace RailwayBrakeShoe
             Config = Settings.Load<Settings>(modEntry);
             modEntry.OnGUI = DrawGui;
             modEntry.OnSaveGUI = delegate(UnityModManager.ModEntry e) { Config.Save(e); };
-            modEntry.OnUpdate = Update;
             modEntry.OnToggle = Toggle;
 
             try
@@ -104,7 +103,10 @@ namespace RailwayBrakeShoe
                 PatchIfPresent(typeof(DV.Shops.ScanItemCashRegisterModule), "InitializeData", typeof(ShopPricePatches), "RegisterInitializePrefix", HarmonyPatchType.Prefix);
                 PatchIfPresent(typeof(DV.Shops.ScanItemCashRegisterModule), "InitializeData", typeof(ShopPricePatches), "RegisterInitializePostfix", HarmonyPatchType.Postfix);
                 PatchIfPresent(typeof(DV.Shops.ScanItemCashRegisterModule), "UpdateTexts", typeof(ShopPricePatches), "UpdateTextsPostfix", HarmonyPatchType.Postfix);
-                PatchIfPresent(AccessTools.TypeByName("ShopRework.ShopReworkManager"), "RegisterShopItem", typeof(ShopPricePatches), "ShopReworkRegisterPrefix", HarmonyPatchType.Prefix);
+                Type shopRework = AccessTools.TypeByName("ShopRework.ShopReworkManager");
+                if (shopRework != null)
+                    PatchIfPresent(shopRework, "RegisterShopItem", typeof(ShopPricePatches), "ShopReworkRegisterPrefix", HarmonyPatchType.Prefix);
+                CareerPriceCompatibility.Install(harmony);
                 PatchIfPresent(typeof(ItemPlacerNonVr), "UpdateHelperPosition", typeof(PlacementPatches), "UpdateHelperPositionPostfix", HarmonyPatchType.Postfix);
                 PatchIfPresent(typeof(ItemPlacerNonVr), "UpdateHelperRotation", typeof(PlacementPatches), "UpdateHelperRotationPrefix", HarmonyPatchType.Prefix);
                 PatchIfPresent(typeof(ItemPlacerNonVr), "CheckOverlaps", typeof(PlacementPatches), "CheckOverlapsPrefix", HarmonyPatchType.Prefix);
@@ -112,7 +114,7 @@ namespace RailwayBrakeShoe
                 PatchIfPresent(typeof(ItemPlacerNonVr), "ResolvePlacement", typeof(PlacementPatches), "ResolvePlacementPrefix", HarmonyPatchType.Prefix);
                 PatchIfPresent(typeof(ItemPlacerNonVr), "FinalizePlacement", typeof(PlacementPatches), "FinalizePlacementPostfix", HarmonyPatchType.Postfix);
                 PatchIfPresent(typeof(ItemPlacerNonVr), "CancelPlacement", typeof(PlacementPatches), "CancelPlacementPostfix", HarmonyPatchType.Postfix);
-                PatchIfPresent(AccessTools.TypeByName("DV.Simulation.Brake.BrakeSystem"), "SimulateBrakingForce", typeof(HandbrakePatch), "Postfix", HarmonyPatchType.Postfix);
+                PatchIfPresent(typeof(DV.Simulation.Brake.BrakeSystem), "SimulateBrakingForce", typeof(HandbrakePatch), "Transpiler", HarmonyPatchType.Transpiler);
                 PatchIfPresent(AccessTools.TypeByName("I2.Loc.LocalizationManager"), "GetTranslation", typeof(BrakeShoeLocalization), "GetTranslationPostfix", HarmonyPatchType.Postfix);
                 // v1.2.0: Job completion handbrake check. If a car has a brake shoe
                 // near its wheels, count it as having handbrake applied.
@@ -124,6 +126,8 @@ namespace RailwayBrakeShoe
                 PatchIfPresent(typeof(StorageController), "MoveItemsFromWorldToLostAndFound", typeof(ShoeRecoveryPatches), "FilterTranspiler", HarmonyPatchType.Transpiler);
                 PatchIfPresent(typeof(RespawnOnDrop), "RespawnOrDestroy", typeof(ShoeRecoveryPatches), "RespawnPrefix", HarmonyPatchType.Prefix);
                 ShopStockPatches.Install(harmony);
+                StationShoePatches.Install();
+                UnloadWatcher.UnloadRequested += ClearWorldCaches;
                 modEntry.Logger.Log("Initialized against the current game assemblies. Optional patches fail closed.");
                 return true;
             }
@@ -136,11 +140,17 @@ namespace RailwayBrakeShoe
 
         private static bool Toggle(UnityModManager.ModEntry entry, bool enabled)
         {
-            foreach (BrakeShoeBehaviour shoe in new List<BrakeShoeBehaviour>(Shoes))
-            {
-                if (shoe != null) shoe.enabled = enabled;
-            }
+            StationShoePatches.SetEnabled(enabled);
+            // OnDisable removes ordinary shoes from the active set. Use their
+            // existing lifetime registry so the next toggle can find them again.
+            ShopStockPatches.SetShoesEnabled(enabled);
             return true;
+        }
+
+        private static void ClearWorldCaches()
+        {
+            RailPlacement.ClearWorldCaches();
+            PlacementPatches.ClearWorldCaches();
         }
 
         private static void PatchIfPresent(Type targetType, string targetName, Type patchType, string patchName, HarmonyPatchType kind)
@@ -173,10 +183,6 @@ namespace RailwayBrakeShoe
             }
         }
 
-        private static void Update(UnityModManager.ModEntry entry, float dt)
-        {
-        }
-
         // Step for the sliders whose range is a 0..1 fraction. Without it the
         // GUI reports values like 0.898, which reads as a measurement rather
         // than a choice; a tenth is as fine as any of these three need to be.
@@ -185,48 +191,54 @@ namespace RailwayBrakeShoe
         private static void DrawGui(UnityModManager.ModEntry entry)
         {
             string lang = GetCurrentLanguage();
-            bool isRussian = lang != null && lang.StartsWith("ru", StringComparison.OrdinalIgnoreCase);
+            bool isRussian = BrakeShoeLocalization.IsRussian(lang);
 
-            GUILayout.Label(isRussian ? "Тормозной башмак - физика" : "Railway Brake Shoe - physics");
-            Config.DryFriction = Slider(isRussian ? "Трение (сухое)" : "Dry friction", Config.DryFriction, 0.05f, 0.8f, 0.01f);
-            Config.WetFrictionMultiplier = Slider(isRussian ? "Множитель (мокрое)" : "Wet multiplier", Config.WetFrictionMultiplier, 0.15f, 1f, 0.01f);
-            Config.MaximumBrakeForce = Slider(isRussian ? "Макс. тормозная сила (Н)" : "Maximum brake force (N)", Config.MaximumBrakeForce, 10000f, 1500000f, 10000f);
+            GUILayout.Label(isRussian ? "Тормозной башмак — физика" : "Railway Brake Shoe — Physics");
+            Config.DryFriction = Slider(isRussian ? "Трение на сухом рельсе" : "Dry rail friction", Config.DryFriction, 0.05f, 0.8f, 0.01f);
+            Config.WetFrictionMultiplier = Slider(isRussian ? "Мокрый рельс: множитель трения" : "Wet rail friction multiplier", Config.WetFrictionMultiplier, 0.15f, 1f, 0.01f);
+            Config.MaximumBrakeForce = Slider(isRussian ? "Макс. тормозная сила (Н)" : "Maximum braking force (N)", Config.MaximumBrakeForce, 10000f, 1500000f, 10000f);
             Config.BreakawayForce = Slider(isRussian ? "Порог срыва (Н)" : "Breakaway threshold (N)", Config.BreakawayForce, 10000f, 1250000f, 10000f);
 
             GUILayout.Space(10f);
             GUILayout.Label(isRussian ? "Контакт с колесом" : "Wheel contact");
-            Config.CaptureHalfLength = Slider(isRussian ? "Полудлина захвата (м)" : "Capture half-length (m)", Config.CaptureHalfLength, 0.08f, 0.5f, 0f);
+            Config.CaptureHalfLength = Slider(isRussian ? "Половина длины зоны контакта (м)" : "Contact zone half-length (m)", Config.CaptureHalfLength, 0.08f, 0.5f, 0f);
 
             GUILayout.Space(10f);
             GUILayout.Label(isRussian ? "Звук" : "Audio");
-            Config.PlacementVolume = Slider(isRussian ? "Громкость установки" : "Placement volume", Config.PlacementVolume, 0f, 1f, FractionSliderStep);
-            Config.FrictionVolume = Slider(isRussian ? "Громкость трения" : "Friction volume", Config.FrictionVolume, 0f, 1f, FractionSliderStep);
+            Config.PlacementVolume = Slider(isRussian ? "Громкость звука установки" : "Placement sound volume", Config.PlacementVolume, 0f, 1f, FractionSliderStep);
+            Config.FrictionVolume = Slider(isRussian ? "Громкость звука трения" : "Scraping sound volume", Config.FrictionVolume, 0f, 1f, FractionSliderStep);
 
             GUILayout.Space(10f);
             GUILayout.Label(isRussian ? "Аварийные ситуации" : "Hazards");
-            Config.WrongShoeDerailEnabled = GUILayout.Toggle(Config.WrongShoeDerailEnabled, isRussian ? "Сход с рельсов из-за неправильно установленного башмака" : "Derailment from a wrongly placed shoe");
-            Config.WrongShoeDerailChance = Slider(isRussian ? "Шанс схода (неправильный башмак)" : "Derail chance (wrong shoe)", Config.WrongShoeDerailChance, 0f, 1f, 0.01f);
-            Config.HazardCheckInterval = Slider(isRussian ? "Интервал проверки (с)" : "Check interval (s)", Config.HazardCheckInterval, 1f, 10f, 0.5f);
-            Config.SpeedHazardEnabled = GUILayout.Toggle(Config.SpeedHazardEnabled, isRussian ? "Динамический риск на скорости выше 25 км/ч" : "Dynamic speed risk above 25 km/h");
+            Config.WrongShoeDerailEnabled = GUILayout.Toggle(Config.WrongShoeDerailEnabled, isRussian ? "Сход из-за неверного направления башмака" : "Derailment from a shoe facing the wrong way");
+            Config.WrongShoeDerailChance = Slider(isRussian ? "Неверное направление: шанс схода" : "Wrong-way shoe: derailment chance", Config.WrongShoeDerailChance, 0f, 1f, 0.01f);
+            Config.HazardCheckInterval = Slider(isRussian ? "Интервал проверки риска (с)" : "Risk check interval (s)", Config.HazardCheckInterval, 1f, 10f, 0.5f);
+            Config.SpeedHazardEnabled = GUILayout.Toggle(Config.SpeedHazardEnabled, isRussian ? "Риск схода, зависящий от скорости выше 25 км/ч" : "Speed-dependent derailment risk above 25 km/h");
 
             GUILayout.Space(10f);
             GUILayout.Label(isRussian ? "Сброс башмака с рельса" : "Shoe ejection");
-            Config.EjectionImpulseMin = Slider(isRussian ? "Мин. боковой импульс (м/с)" : "Min lateral impulse (m/s)", Config.EjectionImpulseMin, 0.2f, 3f, 0.1f);
-            Config.EjectionImpulseMax = Slider(isRussian ? "Макс. боковой импульс (м/с)" : "Max lateral impulse (m/s)", Config.EjectionImpulseMax, 0.5f, 6f, 0.1f);
+            Config.EjectionImpulseMin = Slider(isRussian ? "Минимальная скорость отбрасывания (м/с)" : "Minimum ejection speed (m/s)", Config.EjectionImpulseMin, 0.2f, 3f, 0.1f);
+            Config.EjectionImpulseMax = Slider(isRussian ? "Максимальная скорость отбрасывания (м/с)" : "Maximum ejection speed (m/s)", Config.EjectionImpulseMax, 0.5f, 6f, 0.1f);
 
             GUILayout.Space(10f);
             GUILayout.Label(isRussian ? "Удерживающая сила" : "Holding force");
-            Config.HandbrakeEquivalent = Slider(isRussian ? "Эквивалент ручных тормозов" : "Equivalent handbrakes", Config.HandbrakeEquivalent, 0.1f, 2f, 0.1f);
+            Config.HandbrakeEquivalent = Slider(isRussian ? "Сила удержания в ручных тормозах" : "Holding strength in handbrakes", Config.HandbrakeEquivalent, 0.1f, 2f, 0.1f);
 
             GUILayout.Space(10f);
             GUILayout.Label(isRussian ? "Прочее" : "Other");
-            Config.BrakeShoeCountsAsHandbrake = GUILayout.Toggle(Config.BrakeShoeCountsAsHandbrake, isRussian ? "Башмак заменяет ручник при сдаче заданий" : "Brake shoe counts as handbrake for job completion");
-            Config.ReduceHandbrake = GUILayout.Toggle(Config.ReduceHandbrake, isRussian ? "Опционально снизить эффективность ручника" : "Optionally reduce handbrake effectiveness");
-            Config.HandbrakeMultiplier = Slider(isRussian ? "Множитель ручника" : "Handbrake multiplier", Config.HandbrakeMultiplier, 0.1f, 1f, FractionSliderStep);
-            Config.DebugLogging = GUILayout.Toggle(Config.DebugLogging, isRussian ? "Логирование отладки состояния" : "Debug state logging");
+            Config.BrakeShoeCountsAsHandbrake = GUILayout.Toggle(Config.BrakeShoeCountsAsHandbrake, isRussian ? "Башмак заменяет ручной тормоз при сдаче заданий" : "Count brake shoes as handbrakes when completing jobs");
+            Config.ReduceHandbrake = GUILayout.Toggle(Config.ReduceHandbrake, isRussian ? "Снизить эффективность ручного тормоза" : "Reduce handbrake effectiveness");
+            Config.HandbrakeMultiplier = Slider(isRussian ? "Множитель силы ручного тормоза" : "Handbrake strength multiplier", Config.HandbrakeMultiplier, 0.1f, 1f, FractionSliderStep);
+            Config.DebugLogging = GUILayout.Toggle(Config.DebugLogging, isRussian ? "Записывать отладочные сообщения в лог" : "Write debug messages to the log");
 
             GUILayout.Space(10f);
-            GUILayout.Label(isRussian ? "Требуется custom_item_mod 0.2.x; предмет/магазин/сохранение обеспечивается им." : "Requires custom_item_mod 0.2.x; item/shop/save lifecycle is provided by it.");
+            Config.AutomaticServiceShoes = GUILayout.Toggle(Config.AutomaticServiceShoes, isRussian ? "Автоматические служебные башмаки" : "Automatic service brake shoes");
+            GUILayout.Label(isRussian
+                ? "Автоматически ставить четыре служебных башмака на новые составы на станциях. Если выключить настройку, уже установленные башмаки останутся до сцепки с локомотивом или удаления состава. На обычные башмаки настройка не влияет."
+                : "Automatically place four service brake shoes on newly spawned trains at stations. Turning this off leaves existing service shoes in place until a locomotive couples to the train or the train is removed. This does not affect regular brake shoes.",
+                new GUIStyle(GUI.skin.label) { wordWrap = true });
+
+            GUILayout.Space(10f);
         }
 
         internal static string GetCurrentLanguage()
@@ -320,7 +332,7 @@ namespace RailwayBrakeShoe
             {
                 foreach (BrakeShoeBehaviour shoe in Main.Shoes)
                 {
-                    if (shoe == null) continue;
+                    if (shoe == null || shoe.IsServiceShoe) continue;
                     shoe.RefreshJobSecurity(car);
                     if (shoe.SecuredCar == car) return true;
                 }
@@ -341,7 +353,7 @@ namespace RailwayBrakeShoe
             {
                 foreach (BrakeShoeBehaviour shoe in Main.Shoes)
                 {
-                    if (shoe == null) continue;
+                    if (shoe == null || shoe.IsServiceShoe) continue;
                     shoe.RefreshJobSecurity(car);
                     if (shoe.SecuredCar == car) count++;
                 }
@@ -363,7 +375,7 @@ namespace RailwayBrakeShoe
             {
                 foreach (BrakeShoeBehaviour shoe in Main.Shoes)
                 {
-                    if (shoe == null) continue;
+                    if (shoe == null || shoe.IsServiceShoe) continue;
                     if (shoe.ContactCar == car) return true;
                 }
             }
@@ -396,7 +408,7 @@ namespace RailwayBrakeShoe
             {
                 foreach (BrakeShoeBehaviour shoe in Main.Shoes)
                 {
-                    if (shoe == null || !shoe.IsAnchored) continue;
+                    if (shoe == null || shoe.IsServiceShoe || !shoe.IsAnchored) continue;
                     // Into the car's local frame first: Bounds is axis-aligned in
                     // local space, and a world-space box around a car sitting at an
                     // angle would reach well past its actual body.
@@ -419,10 +431,10 @@ namespace RailwayBrakeShoe
         // inventory entry and CustomItemInfo cannot drift apart.
         internal const string EnglishName = "Railway Brake Shoe";
         internal const string EnglishDescription =
-            "A steel railway brake shoe. Place it on a rail in either direction.";
+            "A steel brake shoe for holding or slowing wagons and locomotives. Place it on a rail and turn it to face the approaching wheel.";
         private const string RussianName = "Тормозной башмак";
         private const string RussianDescription =
-            "Стальной тормозной башмак. Установите на рельс в любом направлении.";
+            "Стальной башмак для удержания и торможения вагонов и локомотивов. Установите его на рельс и разверните навстречу приближающемуся колесу.";
 
         /// <summary>
         /// Postfix on I2.Loc.LocalizationManager.GetTranslation that answers for
@@ -442,14 +454,14 @@ namespace RailwayBrakeShoe
         /// Anything other than Russian gets English, which is also what an
         /// unreadable language setting falls back to.
         /// </summary>
-        internal static void GetTranslationPostfix(ref string __result, string Term)
+        internal static void GetTranslationPostfix(ref string __result, string Term, string overrideLanguage)
         {
             try
             {
                 if (Term != NameKey && Term != DescKey) return;
 
-                string lang = Main.GetCurrentLanguage();
-                bool russian = lang != null && lang.StartsWith("ru", StringComparison.OrdinalIgnoreCase);
+                string lang = string.IsNullOrEmpty(overrideLanguage) ? Main.GetCurrentLanguage() : overrideLanguage;
+                bool russian = IsRussian(lang);
 
                 if (Term == NameKey)
                 {
@@ -461,6 +473,15 @@ namespace RailwayBrakeShoe
                 }
             }
             catch { }
+        }
+
+        internal static bool IsRussian(string language)
+        {
+            return !string.IsNullOrEmpty(language) &&
+                (language.Equals("ru", StringComparison.OrdinalIgnoreCase) ||
+                 language.StartsWith("ru-", StringComparison.OrdinalIgnoreCase) ||
+                 language.StartsWith("ru_", StringComparison.OrdinalIgnoreCase) ||
+                 language.Equals("Russian", StringComparison.OrdinalIgnoreCase) || language.Equals("Русский", StringComparison.OrdinalIgnoreCase));
         }
 
         internal static void SetLocalizationKeys(InventoryItemSpec spec)
@@ -547,6 +568,11 @@ namespace RailwayBrakeShoe
             InventoryItemSpec localSpec = customItem.ItemPrefab.GetComponent<InventoryItemSpec>();
             if (localSpec == null || localSpec != customItem.ItemSpec)
                 throw new InvalidOperationException("Brake-shoe InventoryItemSpec is not on the custom item prefab.");
+
+            // Native hotbar/inventory selects the ghost icon for an item taken
+            // out of its slot (including the held item), and the standard icon
+            // when returned. No per-frame icon swap or interaction patch.
+            localSpec.ItemIconSpriteDropped = BrakeShoeFactory.CreateDroppedIcon(localSpec.ItemIconSprite);
 
             // custom_item_mod keeps this object below an inactive staging parent.
             // activeSelf must be true so Resources.Load clones run Spec.Item.Awake;
@@ -662,6 +688,9 @@ namespace RailwayBrakeShoe
         [HarmonyPriority(Priority.First)]
         internal static void RegisterInitializePrefix(DV.Shops.ScanItemCashRegisterModule __instance)
         {
+            // Vanilla InitializeData reads the catalogue first; optional price
+            // mods then transform that base exactly once in their postfixes.
+            if (__instance != null && IsBrakeShoe(__instance.sellingItemSpec)) EnsureBrakeShoePrice(Main.CustomItem);
             if (!ShopReworkActive || __instance == null) return;
             float basePrice;
             if (TryGetCataloguePrice(__instance.sellingItemSpec, out basePrice))
@@ -669,6 +698,8 @@ namespace RailwayBrakeShoe
         }
 
         [HarmonyPriority(Priority.Last)]
+        [HarmonyAfter("CareerRework")]
+        [HarmonyBefore("ShopRework")]
         internal static void RegisterInitializePostfix(DV.Shops.ScanItemCashRegisterModule __instance)
         {
             if (__instance == null || __instance.sellingItemSpec == null) return;
@@ -681,10 +712,13 @@ namespace RailwayBrakeShoe
             if (brakeShoe) basePrice = BrakeShoePrice;
             else if (!ShopReworkActive || !TryGetCataloguePrice(__instance.sellingItemSpec, out basePrice)) return;
 
-            // This mod owns the shoe's price outright, so write it either way;
-            // for other products only a missing price is filled in.
-            if (brakeShoe || data.pricePerUnit <= 0f) data.pricePerUnit = basePrice;
-            if (ShopReworkActive) UpdateShopReworkBaseline(__instance, basePrice);
+            // Keep the result of Career Rework's native multiplier. Only the
+            // established free-mode rule overrides an initialized shoe price.
+            if ((brakeShoe && !IsCareerSession) || data.pricePerUnit <= 0f) data.pricePerUnit = basePrice;
+            // InitializeData has produced the undiscounted price, including
+            // Career Rework's optional postfix. Shop Rework reapplies its saved
+            // discount after this patch; do not seed it from the old catalogue.
+            if (ShopReworkActive) UpdateShopReworkBaseline(__instance, data.pricePerUnit, true);
         }
 
         // Runs immediately before ShopRework records a module. This guarantees
@@ -705,6 +739,9 @@ namespace RailwayBrakeShoe
             if (refreshingPriceText || __instance == null || !IsBrakeShoe(__instance.sellingItemSpec)) return;
             CashRegisterModule.CashRegisterModuleData data = __instance.Data;
             if (data == null) return;
+            // Formatting must not overwrite Career multipliers, Shop discounts
+            // (including a legitimate zero) or another mod's final Career price.
+            if (IsCareerSession) return;
 
             float price = BrakeShoePrice;
             float previous = data.pricePerUnit;
@@ -789,7 +826,7 @@ namespace RailwayBrakeShoe
             return restored;
         }
 
-        private static void UpdateShopReworkBaseline(DV.Shops.ScanItemCashRegisterModule register, float basePrice)
+        private static void UpdateShopReworkBaseline(DV.Shops.ScanItemCashRegisterModule register, float basePrice, bool initialized = false)
         {
             if (!ShopReworkActive || register == null || basePrice <= 0f) return;
             try
@@ -799,7 +836,7 @@ namespace RailwayBrakeShoe
                 if (prices == null || string.IsNullOrEmpty(shopName) || shopName == "Unknown") return;
                 string key = shopName + "::" + register.name;
                 object existing = prices.Contains(key) ? prices[key] : null;
-                if (existing == null || Convert.ToSingle(existing) <= 0f) prices[key] = basePrice;
+                if (initialized || existing == null || Convert.ToSingle(existing) <= 0f) prices[key] = basePrice;
             }
             catch (Exception ex)
             {
@@ -1321,6 +1358,30 @@ namespace RailwayBrakeShoe
             return Sprite.Create(texture, new Rect(0f, 0f, size, size), new Vector2(0.5f, 0.5f), 100f);
         }
 
+        private static Sprite droppedIcon;
+
+        internal static Sprite CreateDroppedIcon(Sprite fallback)
+        {
+            if (droppedIcon != null) return droppedIcon;
+            string path = Path.Combine(assetRoot ?? string.Empty, "railway_brake_shoe_icon_dropped.png");
+            Texture2D texture = null;
+            try
+            {
+                texture = new Texture2D(2, 2, TextureFormat.RGBA32, false);
+                if (!texture.LoadImage(File.ReadAllBytes(path), true))
+                    throw new InvalidDataException("Invalid ghost icon image.");
+                texture.name = "RailwayBrakeShoe_Icon_Dropped";
+                droppedIcon = Sprite.Create(texture, new Rect(0f, 0f, texture.width, texture.height), new Vector2(0.5f, 0.5f), 100f);
+                return droppedIcon;
+            }
+            catch (Exception ex)
+            {
+                if (texture != null) UnityEngine.Object.Destroy(texture);
+                Main.LogAlways("Ghost icon could not be loaded; using standard icon: " + ex.Message);
+                return fallback;
+            }
+        }
+
         // There was a debug spawner here that instantiated the item prefab in
         // front of the camera. Removed with its GUI button: a shoe made that way
         // never belonged to the player, so it could not be registered with the
@@ -1365,6 +1426,9 @@ namespace RailwayBrakeShoe
         }
     }
 
+    // Native Bogie/TrainCar scripts have execution order 0. Read the traveller
+    // after its physics-pose refresh, never a previous step chosen by spawn order.
+    [DefaultExecutionOrder(100)]
     public sealed partial class BrakeShoeBehaviour : MonoBehaviour, ICustomNonVRGrabAnchor
     {
         // StopContact was dropped here: nothing assigned it and nothing compared
@@ -1415,12 +1479,14 @@ namespace RailwayBrakeShoe
                 if (stateValue == value) return;
                 ShoeState previous = stateValue;
                 stateValue = value;
-                Main.Log("Shoe state " + previous + " -> " + value);
+                if (Main.Config.DebugLogging) Main.Log("Shoe state " + previous + " -> " + value);
             }
         }
         private ShoeState stateValue = ShoeState.Free;
         private Rigidbody body;
-        private Vector3 lastForce;
+        private float? railPoseQueueTime;
+        private Vector3 railPoseQueuePosition;
+        private Quaternion railPoseQueueRotation;
         internal bool snappedToRail;
         private ItemSaveData saveData;
         private DV.CabControls.ItemBase item;
@@ -1572,7 +1638,6 @@ namespace RailwayBrakeShoe
         // Wheel engagement state.
         private Bogie contactBogie;
         private TrainCar contactCar;
-        private Vector3 contactPoint;
         private float lastAppliedForce;
         private double capturedSpanOffset;
         private bool hasCapturedOffset;
@@ -1627,22 +1692,20 @@ namespace RailwayBrakeShoe
         // it no longer travels with the wheel that was pushing it, and each axle
         // passing over it is rolled against.
         private bool jammedInFrog;
+        private bool jammedAtInternalFrog;
+        private bool restoreInternalJam;
+        private bool restoreJamKindKnown;
+        private string droppedSupportPath, droppedSupportName;
+        private RailTrack droppedSupportTrack;
+        private Vector3 droppedSupportOffset;
+        private bool restoreDroppedSupport;
+        internal bool IsPermanentFrogJam { get { return jammedInFrog && jammedAtInternalFrog && !IsServiceShoe; } }
         // Where it jammed, kept only for the log line.
         private string jammedJunctionName;
-        // Whether this dragged shoe has already been latched in the current frog
-        // window, so the deterministic jam is applied only once per approach.
-        private bool frogJamRolled;
         // The bogie last rolled against while the shoe sits jammed, so a single
         // axle standing on it is not rolled against on the same timer as the
         // axles still arriving.
         private Bogie jammedRolledBogie;
-
-        // Half-length of the window around a junction node, in metres of span,
-        // inside which a travelling shoe is treated as being at the frog. The
-        // frog is the crossing casting where the rails intersect and a shoe
-        // dragged into it has somewhere to wedge; a metre either side of the node
-        // covers that casting on DV's switches without reaching into plain track.
-        private const double FrogWindowHalfLength = 1.0;
 
         // v1.2.0: High-speed collision hazard. One-shot flag per contact to ensure
         // the high-speed check fires only once at first contact, not on every step.
@@ -1783,7 +1846,7 @@ namespace RailwayBrakeShoe
 
         private void Awake()
         {
-            ShopStockPatches.Track(this);
+            if (!IsServiceShoe) ShopStockPatches.Track(this);
             body = GetComponent<Rigidbody>();
             item = GetComponent<DV.CabControls.ItemBase>();
             respawnOnDrop = FindRespawnOnDrop();
@@ -1851,6 +1914,16 @@ namespace RailwayBrakeShoe
             if (!string.IsNullOrEmpty(PurchaseShopId)) data["railwayBrakeShoeShop"] = PurchaseShopId;
             data["railwayBrakeShoePlaced"] = snappedToRail;
             data["railwayBrakeShoeState"] = State.ToString();
+            if (droppedSupportTrack != null)
+            {
+                Vector3 center, forward, up;
+                if (RailPlacement.TryGetPoseAtSpan(droppedSupportTrack, 0.0, out center, out forward, out up))
+                    droppedSupportOffset = center - transform.position;
+            }
+            if (!string.IsNullOrEmpty(droppedSupportPath))
+                data["railwayBrakeShoeSupportOffset"] = new JArray(droppedSupportOffset.x, droppedSupportOffset.y, droppedSupportOffset.z);
+            data["railwayBrakeShoeSupportPath"] = droppedSupportPath;
+            data["railwayBrakeShoeSupportName"] = droppedSupportName;
             if (snappedToRail && currentTrack != null)
             {
                 // Track names are NOT unique in this game, so the name alone
@@ -1878,7 +1951,11 @@ namespace RailwayBrakeShoe
                 // reload; the whole point of the hazard is that it stays until
                 // somebody picks it up. Written unconditionally so a shoe that has
                 // been freed also records that.
-                data["railwayBrakeShoeJammed"] = jammedInFrog;
+                // A shoe pushed after its own FixedUpdate may still have an
+                // unconsumed blade event when a save runs. Preserve that proven
+                // collision as the existing non-internal jam, never a free pass.
+                data["railwayBrakeShoeJammed"] = jammedInFrog || pendingSwitchConflict != null;
+                data["railwayBrakeShoeInternalJam"] = jammedInFrog && jammedAtInternalFrog;
             }
             return data;
         }
@@ -1888,7 +1965,31 @@ namespace RailwayBrakeShoe
             if (data == null) return;
             JToken shop = data["railwayBrakeShoeShop"];
             PurchaseShopId = shop != null && shop.Type == JTokenType.String ? (string)shop : null;
+            JToken supportPath = data["railwayBrakeShoeSupportPath"], supportName = data["railwayBrakeShoeSupportName"];
+            droppedSupportPath = supportPath != null && supportPath.Type == JTokenType.String ? (string)supportPath : null;
+            droppedSupportName = supportName != null && supportName.Type == JTokenType.String ? (string)supportName : null;
             JToken placed = data["railwayBrakeShoePlaced"];
+            JArray supportOffset = data["railwayBrakeShoeSupportOffset"] as JArray;
+            droppedSupportOffset = Vector3.zero;
+            if (supportOffset != null && supportOffset.Count == 3)
+            {
+                bool numeric = true;
+                foreach (JToken component in supportOffset)
+                    numeric &= component.Type == JTokenType.Float || component.Type == JTokenType.Integer;
+                if (numeric) droppedSupportOffset = new Vector3((float)supportOffset[0], (float)supportOffset[1], (float)supportOffset[2]);
+            }
+            droppedSupportTrack = null;
+            restoreDroppedSupport = !IsServiceShoe && !string.IsNullOrEmpty(droppedSupportPath) &&
+                !(placed != null && placed.Type == JTokenType.Boolean && (bool)placed) &&
+                !(item != null && (item.IsGrabbed() || item.IsSnapped || item.InContainer != null));
+            if (restoreDroppedSupport)
+            {
+                restorePosition = transform.position;
+                restoreDeadline = Time.time + RestoreWindowSeconds;
+                nextRestoreAttempt = 0f;
+                BeginRestoreHold();
+                RestoreDroppedSupport();
+            }
             if (placed == null || placed.Type != JTokenType.Boolean || !(bool)placed) return;
 
             JToken trackPath = data["railwayBrakeShoeTrackPath"];
@@ -1923,6 +2024,11 @@ namespace RailwayBrakeShoe
             restoreSpan = sp;
             restoreSpanKnown = haveSpan;
             restoreJammed = jammed != null && jammed.Type == JTokenType.Boolean && (bool)jammed;
+            JToken internalJam = data["railwayBrakeShoeInternalJam"];
+            restoreJamKindKnown = internalJam != null && internalJam.Type == JTokenType.Boolean;
+            restoreInternalJam = restoreJammed && restoreJamKindKnown && (bool)internalJam;
+            // Legacy failed random-passage flags are deliberately ignored: an
+            // old save must not exempt a later physical blade collision.
             restorePosition = transform.position;
             restoreDeadline = Time.time + RestoreWindowSeconds;
             nextRestoreAttempt = 0f;
@@ -1989,6 +2095,9 @@ namespace RailwayBrakeShoe
             if (restoreJammed)
             {
                 jammedInFrog = true;
+                // Old saves stored one flag for both obstacles. Classify only
+                // an actual contact with the authored nose, never proximity to a switch.
+                jammedAtInternalFrog = restoreJamKindKnown ? restoreInternalJam : IsAtInternalFrog();
                 Main.LogAlways("Restored brake shoe is still jammed in a switch frog.");
             }
             if (restoreAttempts > 1)
@@ -2014,6 +2123,9 @@ namespace RailwayBrakeShoe
             SuspendRespawnOnDrop();
             if (body != null)
             {
+                // Select a supported mode before entering the kinematic hold,
+                // including the frames spent waiting for a saved rail to load.
+                body.collisionDetectionMode = CollisionDetectionMode.ContinuousSpeculative;
                 body.isKinematic = true;
                 body.velocity = Vector3.zero;
                 body.angularVelocity = Vector3.zero;
@@ -2042,6 +2154,7 @@ namespace RailwayBrakeShoe
             ReassertRespawnSuspension();
             if (body != null && !body.isKinematic)
             {
+                body.collisionDetectionMode = CollisionDetectionMode.ContinuousSpeculative;
                 body.isKinematic = true;
                 body.velocity = Vector3.zero;
                 body.angularVelocity = Vector3.zero;
@@ -2058,6 +2171,9 @@ namespace RailwayBrakeShoe
         /// </summary>
         private void CancelRestore()
         {
+            droppedSupportPath = droppedSupportName = null;
+            droppedSupportTrack = null;
+            restoreDroppedSupport = false;
             if (!restorePending && !restoreHoldActive) return;
             restorePending = false;
             EndRestoreHold();
@@ -2076,6 +2192,7 @@ namespace RailwayBrakeShoe
             {
                 body.isKinematic = false;
                 body.interpolation = RigidbodyInterpolation.None;
+                body.collisionDetectionMode = CollisionDetectionMode.ContinuousDynamic;
             }
         }
 
@@ -2087,6 +2204,9 @@ namespace RailwayBrakeShoe
         internal void AttachToRail(RailTrack track, bool reversed, float side, double span, bool spanKnown)
         {
             currentTrack = track;
+            droppedSupportPath = droppedSupportName = null;
+            droppedSupportTrack = null;
+            restoreDroppedSupport = false;
             isReversed = reversed;
             railSide = side;
             reportedPhysicsRestore = false;
@@ -2105,6 +2225,12 @@ namespace RailwayBrakeShoe
             // A shoe being put on a rail is a shoe that is not stuck in anything.
             // The restore path re-applies a saved jam right after this returns.
             jammedInFrog = false;
+            jammedAtInternalFrog = false;
+            pendingSwitchConflict = null;
+            switchImpactBogie = null;
+            switchImpactSpeed = null;
+            switchCutTrack = null;
+            switchCutMarker = null;
             jammedJunctionName = null;
             ClearEngagement();
 
@@ -2115,10 +2241,10 @@ namespace RailwayBrakeShoe
                 // Kinematic while on the rail: the game's own bogies are moved
                 // with MovePosition along their traveller rather than being left
                 // to PhysX, and the shoe must ride the same way to stay aligned.
-                body.isKinematic = true;
                 // v1.2.0: ContinuousSpeculative for kinematic bodies to prevent
                 // fast-moving wheels from phasing through the shoe.
                 body.collisionDetectionMode = CollisionDetectionMode.ContinuousSpeculative;
+                body.isKinematic = true;
                 // The pose is only recomputed in FixedUpdate, so without
                 // interpolation the shoe is redrawn at the same 50 Hz staircase
                 // while the camera and the train move at frame rate. That reads
@@ -2498,6 +2624,12 @@ namespace RailwayBrakeShoe
             // there. Cleared before ClearEngagement, which deliberately leaves the
             // flag alone so a wheel rolling clear does not un-jam it.
             jammedInFrog = false;
+            jammedAtInternalFrog = false;
+            pendingSwitchConflict = null;
+            switchImpactBogie = null;
+            switchImpactSpeed = null;
+            switchCutTrack = null;
+            switchCutMarker = null;
             jammedJunctionName = null;
             ClearEngagement();
             // A shoe that is no longer on a rail cannot be scraping one, and
@@ -2527,10 +2659,164 @@ namespace RailwayBrakeShoe
             }
         }
 
+        // Service-only rest cache. The physical constraint stays live: PhysX
+        // still decides whether external loads break it. No wagon is frozen.
+        private sealed class ServiceRestState
+        {
+            internal ConfigurableJoint Joint;
+            internal DV.PointSet.EquiPointSet Points;
+            internal DV.PointSet.EquiPointSet.Point First, Second;
+            internal int Index;
+            internal double Span;
+            internal Vector3 Move, Position;
+            internal Quaternion Rotation;
+            internal float NextCapacity, Handbrake, Wetness, Equivalent, Dry, WetMultiplier, Maximum, Breakaway;
+            internal bool CapacityKnown;
+        }
+        private ServiceRestState serviceRest;
+        private static float serviceWeatherTime = float.NegativeInfinity;
+        private static float serviceWeather;
+
+        private static bool SameServicePoint(DV.PointSet.EquiPointSet.Point a, DV.PointSet.EquiPointSet.Point b)
+        {
+            return a.position.x == b.position.x && a.position.y == b.position.y && a.position.z == b.position.z &&
+                a.forward.Equals(b.forward) && a.up.Equals(b.up) && a.span == b.span && a.spanToNextPoint == b.spanToNextPoint;
+        }
+
+        private void CaptureServiceRest()
+        {
+            // Let the existing audio fade/particle cleanup finish after sliding.
+            if (!HasStaticHold || !IsAnchored || isScraping || frictionLevel > 0f ||
+                body == null || !body.isKinematic || holdingBogie.track != currentTrack) return;
+            DV.PointSet.EquiPointSet points = currentTrack.GetKinkedPointSet();
+            if (points == null || points.points == null || points.points.Length < 2) return;
+            int index = points.GetPointIndexForSpan(railSpan);
+            if (index < 0 || index + 1 >= points.points.Length) return;
+            if (serviceRest == null) serviceRest = new ServiceRestState();
+            // The full path may have refreshed this joint while rest was
+            // invalid. Re-seed the cache on every transition back into rest.
+            serviceRest.CapacityKnown = false;
+            serviceRest.NextCapacity = 0f;
+            serviceRest.Joint = holdingJoint;
+            serviceRest.Points = points;
+            serviceRest.Index = index;
+            serviceRest.First = points.points[index];
+            serviceRest.Second = points.points[index + 1];
+            serviceRest.Span = railSpan;
+            serviceRest.Move = WorldMover.currentMove;
+            serviceRest.Position = body.position;
+            serviceRest.Rotation = body.rotation;
+        }
+
+        private bool UpdateServiceRest()
+        {
+            ServiceRestState rest = serviceRest;
+            if (rest == null || !HasStaticHold || rest.Joint != holdingJoint || !IsAnchored ||
+                !wheelTouching || !offsetLocked || contactFromBehind || jammedInFrog || isScraping ||
+                frictionLevel > 0f || body == null || !body.isKinematic || holdingBogie.traveller == null ||
+                holdingBogie.track != currentTrack || railSpan != rest.Span ||
+                body.position != rest.Position || body.rotation != rest.Rotation ||
+                WorldMover.currentMove != rest.Move) return false;
+
+            // Mutable point sets (including turntables) and origin shifts must
+            // return to the existing rail-pose path in the very same step.
+            DV.PointSet.EquiPointSet points = currentTrack.GetKinkedPointSet();
+            if (points != rest.Points || points.points == null || rest.Index + 1 >= points.points.Length ||
+                !SameServicePoint(rest.First, points.points[rest.Index]) ||
+                !SameServicePoint(rest.Second, points.points[rest.Index + 1]) ||
+                Math.Abs(holdingBogie.traveller.Span - holdingBogieSpan) > HoldSeparationTolerance) return false;
+
+            // This existing check frees the one-sided joint on real separation.
+            // Its false result on the FREE side below 2 mm still means a live hold.
+            KeepHeldTraveller(holdingBogie, 0f);
+            if (!HasStaticHold) return false;
+            if (Time.time >= rest.NextCapacity)
+            {
+                rest.NextCapacity = Time.time + 0.5f;
+                if (!RefreshServiceCapacity(rest)) return false;
+            }
+            lastAppliedForce = 0f;
+            slideSpeed = 0f;
+            wheelStopped = true;
+            State = ShoeState.Braking;
+            return true;
+        }
+
+        private bool RefreshServiceCapacity(ServiceRestState rest)
+        {
+            if (contactCar == null || contactCar.Bogies == null) return false;
+            float handbrake = 0f;
+            foreach (Bogie bogie in contactCar.Bogies)
+                if (bogie != null && bogie.rb != null && !bogie.HasDerailed)
+                    handbrake += bogie.maxBrakingForcePerKg * bogie.rb.mass;
+            // Sample reflection-based weather once for all service checks in
+            // this step. Ordinary/dynamic shoe calculations remain unchanged.
+            if (serviceWeatherTime != Time.fixedTime)
+            {
+                serviceWeatherTime = Time.fixedTime;
+                serviceWeather = WeatherCompatibility.GetWetness();
+            }
+            Settings c = Main.Config;
+            if (!rest.CapacityKnown || rest.Handbrake != handbrake || rest.Wetness != serviceWeather ||
+                rest.Equivalent != c.HandbrakeEquivalent || rest.Dry != c.DryFriction ||
+                rest.WetMultiplier != c.WetFrictionMultiplier || rest.Maximum != c.MaximumBrakeForce ||
+                rest.Breakaway != c.BreakawayForce)
+            {
+                float capacity = ShoeRules.Capacity(handbrake, c.HandbrakeEquivalent, c.DryFriction,
+                    serviceWeather, c.WetFrictionMultiplier, c.MaximumBrakeForce, c.BreakawayForce);
+                if (capacity <= 0f) { ReleaseStaticHold(); return false; }
+                if (holdingJoint.breakForce != capacity) holdingJoint.breakForce = capacity;
+                rest.Handbrake = handbrake; rest.Wetness = serviceWeather;
+                rest.Equivalent = c.HandbrakeEquivalent; rest.Dry = c.DryFriction;
+                rest.WetMultiplier = c.WetFrictionMultiplier; rest.Maximum = c.MaximumBrakeForce;
+                rest.Breakaway = c.BreakawayForce; rest.CapacityKnown = true;
+            }
+            return true;
+        }
+
+        private bool TryFindServiceAxle(TrainCar owner, double radius, out Bogie bogie, out double axleSpan, out float direction)
+        {
+            bogie = null; axleSpan = 0.0; direction = 1f;
+            if (owner.Bogies == null) return false;
+            double best = Math.Max(0.01, radius);
+            int mapCount = BuildSearchMaps(best);
+            // Same maps, axle coordinates and nearest-wheel rule as the shared
+            // search, but only the known owner's bogies can be candidates.
+            for (int m = 0; m < mapCount; m++)
+            {
+                RailPlacement.SpanMap map = searchMaps[m];
+                if (map.Track == null) continue;
+                foreach (Bogie candidate in owner.Bogies)
+                {
+                    if (candidate == null || candidate.HasDerailed || candidate.Car != owner ||
+                        candidate.track != map.Track || candidate.traveller == null) continue;
+                    float sign = candidate.TrackDirectionSign;
+                    if (sign == 0f) sign = 1f;
+                    Bogie.AxleInfo[] axles = candidate.Axles;
+                    int count = axles == null || axles.Length == 0 ? 1 : axles.Length;
+                    for (int i = 0; i < count; i++)
+                    {
+                        if (axles != null && axles.Length > 0 && axles[i] == null) continue;
+                        double offset = axles == null || axles.Length == 0 ? 0.0 : axles[i].distanceFromBogiePivot * sign;
+                        double span = map.Map(candidate.traveller.Span + offset);
+                        double distance = Math.Abs(span - railSpan);
+                        if (distance >= best) continue;
+                        best = distance; axleSpan = span; bogie = candidate;
+                        direction = map.Alignment >= 0f ? sign : -sign;
+                    }
+                }
+            }
+            return bogie != null;
+        }
+
         private void FixedUpdate()
         {
+            if (IsServiceShoe)
+            {
+                if (ServiceCollision != null) ServiceCollision.Tick();
+                if (UpdateServiceRest()) return;
+            }
             EnsureItemControl();
-            lastForce = Vector3.zero;
             lastAppliedForce = 0f;
 
             // Safety net only. OnItemGrabbed already detaches on the game's own
@@ -2615,6 +2901,15 @@ namespace RailwayBrakeShoe
 
             if (!snappedToRail || !spanValid || currentTrack == null)
             {
+                if (restoreDroppedSupport)
+                {
+                    if (IsInLostAndFound()) CancelRestore();
+                    else
+                    {
+                        MaintainRestoreHold();
+                        if (Time.time >= nextRestoreAttempt) RestoreDroppedSupport();
+                    }
+                }
                 StopFrictionAudio();
                 ReleasePickupBlock();
                 return;
@@ -2643,10 +2938,10 @@ namespace RailwayBrakeShoe
                 }
                 body.velocity = Vector3.zero;
                 body.angularVelocity = Vector3.zero;
-                body.isKinematic = true;
                 // v1.2.0: ContinuousSpeculative for kinematic bodies to prevent
                 // fast-moving wheels from phasing through the shoe.
                 body.collisionDetectionMode = CollisionDetectionMode.ContinuousSpeculative;
+                body.isKinematic = true;
                 body.interpolation = RigidbodyInterpolation.Interpolate;
             }
 
@@ -2681,6 +2976,7 @@ namespace RailwayBrakeShoe
             // Last: UpdateWheelEngagement above has settled this step's state,
             // and the block is a function of that state.
             UpdatePickupBlock();
+            if (IsServiceShoe) CaptureServiceRest();
         }
 
         /// <summary>
@@ -2873,7 +3169,7 @@ namespace RailwayBrakeShoe
         /// goes through the car. Falls back to the wagon figure when a car has
         /// no livery yet, since this only sets how far a wheel stops short.
         /// </summary>
-        private static float GetWheelRadius(TrainCar car)
+        internal static float GetWheelRadius(TrainCar car)
         {
             if (car == null) return DefaultWheelRadius;
             try
@@ -2932,19 +3228,23 @@ namespace RailwayBrakeShoe
             Bogie bogie;
             double axleSpan;
             float axleDirection;
-            if (!TryFindEngagedAxle(out bogie, out axleSpan, out axleDirection))
+            double contactAlong;
+            bool sweptContact = TryFindSweptAxle(out bogie, out axleSpan, out axleDirection, out contactAlong);
+            if (!sweptContact && !TryFindEngagedAxle(out bogie, out axleSpan, out axleDirection))
             {
                 ClearEngagement();
                 if (State != ShoeState.Free) State = ShoeState.Placed;
                 return;
             }
 
+            if (contactBogie != null && contactBogie != bogie) ClearEngagement();
+            SampleWheelAxle(bogie, axleSpan, axleDirection);
             contactBogie = bogie;
             contactCar = bogie.Car;
-            contactPoint = transform.position + transform.up * 0.05f;
 
             double delta = axleSpan - railSpan;
             float capture = Main.Config.CaptureHalfLength;
+            if (IsServiceShoe) capture = (float)(ServiceContactDistance + ServiceContactGap);
 
             // A shoe is a wedge, so which way round it lies decides everything
             // below. ApplyRailPose maps the model's local +Z - the end stop - onto
@@ -2960,6 +3260,7 @@ namespace RailwayBrakeShoe
             // Every test below is written in this quantity, which is what makes
             // the shoe's facing part of the physics rather than a decoration.
             double alongShoe = delta * workDirection;
+            if (!sweptContact) contactAlong = alongShoe;
 
             float shoeLength = BrakeShoeFactory.VisualBounds.size.z;
             if (shoeLength <= 0f) shoeLength = 0.414f;
@@ -2968,6 +3269,10 @@ namespace RailwayBrakeShoe
             // The wheel rolls up the inclined working surface and comes to rest
             // against the inner face of the stop block. It cannot travel past it.
             double surfaceEnd = shoeLength * BrakeShoeFactory.StopInnerFace;
+            // Service shoes start at the wheel rim, outside the ordinary axle
+            // capture window. Keep that geometric contact during the same hold/
+            // slide path; never pull the automatically placed shoe under the axle.
+            if (IsServiceShoe) surfaceEnd = -ServiceContactDistance;
             // Coming from the other side it meets the outer face of that same
             // block. Everything between the two faces is inside the block, so the
             // line between "on the working surface" and "up against the back of
@@ -2983,14 +3288,23 @@ namespace RailwayBrakeShoe
             // than from the block's back face.
             double wheelClearance = WheelClearanceForHeight(GetWheelRadius(contactCar), shoeHeight * BrakeShoeFactory.StopTopFraction);
             double backReach = stopBack + wheelClearance;
+            if (!IsServiceShoe)
+            {
+                // The axle centre cannot reach the stop's inner face: the rim
+                // hits its top corner first, just as on the already-correct back
+                // face. Use that same physical circle, not an enlarged collider.
+                surfaceEnd -= wheelClearance;
+                capture = (float)Math.Max(capture, -surfaceEnd + HoldSeparationTolerance);
+            }
 
             // Out of reach: the wheel is merely near the shoe. The ramp side keeps
             // the configured capture length, so the tuning for how early a wheel
             // takes the shoe is unchanged; the far side reaches out to where a
             // wheel's rim first meets the top of the stop block, because that is
             // the point contact begins - not where its contact patch would be.
-            if (alongShoe < -capture || alongShoe > backReach)
+            if (!sweptContact && (alongShoe < -capture || alongShoe > backReach))
             {
+                ReleaseStaticHold();
                 State = ShoeState.InitialContact;
                 hasCapturedOffset = false;
                 offsetLocked = false;
@@ -3053,7 +3367,7 @@ namespace RailwayBrakeShoe
             // back of the stop block cannot be re-read as a wheel on the working
             // surface once it has pushed the shoe along a little.
             if (!hasCapturedOffset)
-                contactFromBehind = alongShoe > stopMiddle;
+                contactFromBehind = contactAlong > stopMiddle;
 
             // The wheel came at the back of the end stop: the shoe is lying the
             // wrong way round for this wheel. A real shoe does nothing here - it
@@ -3099,11 +3413,21 @@ namespace RailwayBrakeShoe
                 }
                 else if (pushedSpan < railSpan) targetSpan = Math.Max(pushedSpan, railSpan - maxStep);
                 if (Math.Abs(targetSpan - railSpan) > 1e-7)
-                    MoveWithShoeContacts(targetSpan, speed, new HashSet<BrakeShoeBehaviour>());
+                    MoveWithShoeContacts(targetSpan, speed, IsServiceShoe ? ServicePushChain() : new HashSet<BrakeShoeBehaviour>());
                 // Not Braking: nothing is being braked. The wheel is touching the
                 // shoe, which is what InitialContact means, and keeping it out of
                 // the rolling states also leaves the shoe pickable.
                 State = ShoeState.InitialContact;
+                return;
+            }
+
+            // A live constraint owns this contact, including solver velocity
+            // transients. Never move its kinematic support or add sliding force
+            // while that same constraint is still holding the bogie.
+            if (HasStaticHold && TryHoldStoppedWheel(bogie, speed, workDirection))
+            {
+                wheelStopped = true;
+                State = ShoeState.Braking;
                 return;
             }
 
@@ -3114,7 +3438,7 @@ namespace RailwayBrakeShoe
             // in place.
             if (!hasCapturedOffset)
             {
-                capturedSpanOffset = delta;
+                capturedSpanOffset = contactAlong * workDirection;
                 hasCapturedOffset = true;
                 offsetLocked = true;
                 pushSpanDirection = moving ? spanVelocitySign : 0.0;
@@ -3180,10 +3504,14 @@ namespace RailwayBrakeShoe
             double proposedSpan = followSpan;
             if (Math.Abs(proposedSpan - railSpan) > 1e-7)
             {
-                MoveWithShoeContacts(proposedSpan, speed, new HashSet<BrakeShoeBehaviour>());
+                MoveWithShoeContacts(proposedSpan, speed, IsServiceShoe ? ServicePushChain() : new HashSet<BrakeShoeBehaviour>());
                 proposedSpan = railSpan;
             }
             railSpan = proposedSpan;
+
+            // The separate internal crossing sweep can stop this move before
+            // wheel follow completes. The existing jam hazard then owns contact.
+            if (jammedInFrog) { State = ShoeState.InitialContact; return; }
 
             State = ShoeState.Sliding;
 
@@ -3210,7 +3538,7 @@ namespace RailwayBrakeShoe
             if (speed < 0.5f)
                 requested = Mathf.Max(requested, GetHoldingCapacity(contactCar));
 
-            int active = CountActiveShoes(contactCar);
+            int active = IsServiceShoe ? 2 : CountActiveShoes(contactCar);
             requested *= Mathf.Pow(0.92f, Mathf.Max(0, active - 1));
 
             if (requested > Main.Config.BreakawayForce)
@@ -3228,7 +3556,6 @@ namespace RailwayBrakeShoe
             {
                 Vector3 force = bogie.transform.forward * -Mathf.Sign(bogieSpeed) * requested;
                 bogie.rb.AddForce(force, ForceMode.Force);
-                lastForce = force;
                 lastAppliedForce = requested;
             }
         }
@@ -3263,7 +3590,13 @@ namespace RailwayBrakeShoe
                 return;
             }
 
-            if (TryJamInFrog()) return;
+            if (TryJamInFrog())
+            {
+                // Consume the wheel contact that reached the obstacle this step;
+                // a fast axle may already be clear on the following FixedUpdate.
+                UpdateJammedFrogHazard();
+                return;
+            }
 
             // One unified speed event. It is sampled once per wheel contact and
             // is inactive through 25 km/h. The shoe drop and bogie derailment
@@ -3332,42 +3665,24 @@ namespace RailwayBrakeShoe
         }
 
         /// <summary>
-        /// Rolls for the shoe wedging in a switch frog while a wheel is dragging
-        /// it along. Returns true when it jammed on this step.
+        /// Latches the existing jam state after the wheel-driven sweep reaches
+        /// the obstructed blade throat. Returns true when jammed on this step.
         ///
         /// Only a shoe actually being carried is a candidate: a shoe placed by
         /// hand inside a frog is where the player put it and is left alone. The
-        /// roll is made once per approach, not per step, so crossing a switch is
-        /// one chance rather than fifty.
+        /// latch is applied once per approach. A confirmed blade collision uses
+        /// the existing ejection path, followed by a separate 50% bogie roll.
         /// </summary>
         private bool TryJamInFrog()
         {
-            // Being dragged means the wedge is engaged and the wheel is moving,
-            // which is exactly the Sliding/Breakaway pair.
-            bool dragged = offsetLocked && (State == ShoeState.Sliding || State == ShoeState.Breakaway);
-            if (!dragged)
-            {
-                frogJamRolled = false;
-                return false;
-            }
-
-            string junctionName;
-            if (!IsInFrogWindow(out junctionName))
-            {
-                // Clear of the switch again, so the next one gets its own roll.
-                frogJamRolled = false;
-                return false;
-            }
-
-            // Diagnostic: log when the shoe enters the frog window while being dragged.
-            if (!frogJamRolled)
-            {
-                Main.Log("Shoe being dragged through frog window at " + (junctionName ?? "a switch") + " (span: " + railSpan.ToString("0.00") + " m, state: " + State + "). Jamming shoe.");
-            }
-
-            if (frogJamRolled) return false;
-            frogJamRolled = true;
+            // The swept solid collider is the evidence of movement/contact.
+            // A shoe pushed against its back has no locked braking offset.
+            string junctionName = pendingSwitchConflict;
+            if (junctionName == null) return false;
+            pendingSwitchConflict = null;
+            ReleaseStaticHold();
             jammedInFrog = true;
+            jammedAtInternalFrog = false;
             jammedJunctionName = junctionName;
             jammedRolledBogie = null;
             // The wedge is given up here: a jammed shoe stops following the wheel
@@ -3376,13 +3691,15 @@ namespace RailwayBrakeShoe
             // makes into engagement state.
             offsetLocked = false;
             pushSpanDirection = 0.0;
+            isScraping = false;
+            slideSpeed = 0f;
             ResetHazardTimer();
-            Main.LogAlways("Brake shoe jammed in the frog at " + (junctionName ?? "a switch") + ".");
+            Main.LogAlways("Brake shoe struck the switch blade at " + junctionName + ". Forcing shoe off rail.");
             return true;
         }
 
         /// <summary>
-        /// Rolls against each axle passing over a shoe already jammed in a frog.
+        /// Handles each bogie contacting a shoe already jammed in a frog.
         ///
         /// v1.2.0: One-shot check at first contact, like high-speed collision.
         /// The shoe is a lump of steel in the crossing, so any wheel reaching it
@@ -3390,6 +3707,38 @@ namespace RailwayBrakeShoe
         /// </summary>
         private void UpdateJammedFrogHazard()
         {
+            if (!jammedAtInternalFrog)
+            {
+                // MovePosition submits this step's impact pose to PhysX. Making
+                // the body dynamic in the same step can discard that kinematic
+                // target and eject from the previous pose instead of the blade.
+                // Keep the confirmed event until that one simulation completes.
+                if (body != null && body.isKinematic && railPoseQueueTime == Time.fixedTime) return;
+                // The sweep already proves the blade impact. A pushed shoe
+                // need not touch a wheel itself, and a contact refresh must not
+                // veto ejection or replace the bogie that caused this event.
+                Bogie bladeBogie = switchImpactBogie;
+                float speed = switchImpactSpeed.GetValueOrDefault();
+                // Older saves can contain the short-lived blade jam without an
+                // in-memory event. Only a real current contact can identify its
+                // struck bogie; a nearby approaching axle is insufficient.
+                if (!switchImpactSpeed.HasValue && wheelTouching && !wheelStopped)
+                {
+                    bladeBogie = contactBogie;
+                    speed = Mathf.Abs(lastBogieSpeed);
+                }
+                EjectFromRail(speed);
+                // The physical shoe ejection is unconditional. Only the struck
+                // bogie's outcome is random here, once per consumed impact,
+                // independent of the speed-risk setting used outside turnouts.
+                if (bladeBogie != null && !bladeBogie.HasDerailed && Roll(0.5f))
+                {
+                    Main.LogAlways("Derailing " + DescribeCar(bladeBogie.Car) + ": 50% roll after a switch blade shoe impact.");
+                    DerailBogie(bladeBogie, "struck a brake shoe at a switch blade");
+                }
+                return;
+            }
+
             // wheelTouching, not just contactBogie: the axle search reaches three
             // metres up the track so an approach can be seen coming, and a wheel
             // still that far off has not struck the jammed shoe yet.
@@ -3399,74 +3748,25 @@ namespace RailwayBrakeShoe
                 return;
             }
 
-            // One-shot per bogie: once it's rolled for this axle, that's final.
+            // One event per bogie while it remains in contact.
             if (jammedRolledBogie == contactBogie) return;
             jammedRolledBogie = contactBogie;
 
-            // Every bogie gets its own independent 50% roll.
-            if (!Roll(0.5f)) return;
+            // Ordinary fixed obstacles derail every contacting bogie, including
+            // the wheel that carried the shoe here. Service risk stays unchanged.
+            if (IsServiceShoe && !Roll(0.5f)) return;
 
             Main.LogAlways("Derailing " + DescribeCar(contactCar) + ": wheel struck a brake shoe jammed in " + (jammedJunctionName ?? "a frog") + ".");
-            DerailBogie(contactBogie, "struck a brake shoe jammed in a switch frog");
-            // v1.2.0: Eject the jammed shoe after being struck.
-            EjectFromRail(Mathf.Abs(lastBogieSpeed));
+            Bogie struckBogie = contactBogie;
+            DerailBogie(struckBogie, "struck a brake shoe jammed in a switch frog");
+            // An ordinary shoe trapped in the fixed nose stays for later bogies.
+            // Service objects retain their existing consist-owned lifecycle.
+            if (!IsPermanentFrogJam) EjectFromRail(Mathf.Abs(lastBogieSpeed));
         }
 
-        /// <summary>
-        /// Whether the shoe currently sits within the frog window of a junction at
-        /// either end of its own track, and the name of that junction.
-        ///
-        /// The node is the end of the point set, so this is a span comparison
-        /// against 0 and the track's length. Only a track that genuinely ends at a
-        /// Junction counts: a plain joint between two tracks has no crossing
-        /// casting to catch a shoe.
-        /// </summary>
-        private bool IsInFrogWindow(out string junctionName)
-        {
-            junctionName = null;
-            if (currentTrack == null) return false;
-
-            double total;
-            if (!RailPlacement.TryGetTrackSpan(currentTrack, out total)) return false;
-
-            try
-            {
-                if (railSpan <= FrogWindowHalfLength && currentTrack.inJunction != null &&
-                    IsConflictingTurnoutRoute(currentTrack.inJunction, currentTrack))
-                {
-                    junctionName = currentTrack.inJunction.name;
-                    return true;
-                }
-                if (railSpan >= total - FrogWindowHalfLength && currentTrack.outJunction != null &&
-                    IsConflictingTurnoutRoute(currentTrack.outJunction, currentTrack))
-                {
-                    junctionName = currentTrack.outJunction.name;
-                    return true;
-                }
-            }
-            catch (Exception ex)
-            {
-                Main.Log("Junction lookup for the frog window failed: " + ex.Message);
-            }
-            return false;
-        }
-
-        // A frog window is only hazardous for an approach from an unselected
-        // turnout branch. The Junction object already exposes the authoritative
-        // selectedBranch and outBranches list; using them keeps a correctly
-        // routed shoe from receiving a distance-only frog event.
-        private static bool IsConflictingTurnoutRoute(Junction junction, RailTrack track)
-        {
-            if (junction == null || track == null || junction.outBranches == null) return false;
-            for (int i = 0; i < junction.outBranches.Count; i++)
-            {
-                Junction.Branch branch = junction.outBranches[i];
-                if (branch != null && branch.track == track)
-                    return i != junction.selectedBranch;
-            }
-            return false;
-        }
-
+        // Native branch identity, independent of its numeric ordering or the
+        // shoe's facing. The blade sweep uses it to select the physical rail
+        // side, then tests the actual movement in either direction.
         /// <summary>
         /// Whether a hazard roll is due for this car, restarting the countdown when
         /// the car in contact changes. Returns true at most once per interval and
@@ -3545,7 +3845,33 @@ namespace RailwayBrakeShoe
         /// </summary>
         private void EjectFromRail(float collisionSpeed)
         {
-            if (!IsAnchored) return;
+            if (!IsAnchored || IsPermanentFrogJam) return;
+
+            // The rail basis is independent of the shoe's own facing. Using
+            // transform.right here reversed the lateral impulse whenever
+            // isReversed changed. This only affects the release impulse;
+            // anchored rail placement is resolved independently.
+            Vector3 lateral = transform.right * railSide * (isReversed ? -1f : 1f);
+            Vector3 ejectionUp = Vector3.up;
+            Vector3 centre, forward, trackUp;
+            if (RailPlacement.TryGetPoseAtSpan(currentTrack, railSpan, out centre, out forward, out trackUp))
+            {
+                Vector3 trackRight = Vector3.Cross(trackUp, forward).normalized;
+                if (trackRight.sqrMagnitude > 0.5f)
+                {
+                    lateral = trackRight * railSide;
+                    ejectionUp = trackUp;
+                }
+            }
+
+            // The visible turnout ballast has no native collider. Give the
+            // existing dynamic shoe the same real surface it appears to land on.
+            if (!IsServiceShoe && TurnoutGroundSupport.Ensure(currentTrack))
+            {
+                droppedSupportPath = RailPlacement.GetTrackPath(currentTrack);
+                droppedSupportName = currentTrack.name;
+                droppedSupportTrack = currentTrack;
+            }
 
             // Detach first so the shoe becomes a dynamic body again.
             DetachFromRail("knocked off by wheel impact");
@@ -3554,10 +3880,8 @@ namespace RailwayBrakeShoe
 
             try
             {
-                // Lateral direction: perpendicular to the rail, away from the track centre.
-                Vector3 lateral = transform.right * railSide;
                 // Small upward component so the shoe doesn't just slide flat.
-                Vector3 up = Vector3.up * 0.15f;
+                Vector3 up = ejectionUp * 0.15f;
 
                 // Scale impulse by collision speed, clamped to config range.
                 float speedFactor = Mathf.Clamp01(collisionSpeed / 20f);
@@ -3574,6 +3898,23 @@ namespace RailwayBrakeShoe
             }
         }
 
+        private void RestoreDroppedSupport()
+        {
+            RailTrack track = RailPlacement.FindTrack(droppedSupportPath, droppedSupportName, restorePosition + droppedSupportOffset);
+            if (track != null && TurnoutGroundSupport.Ensure(track))
+            {
+                droppedSupportTrack = track;
+                restoreDroppedSupport = false;
+            }
+            else if (Time.time >= restoreDeadline)
+            {
+                restoreDroppedSupport = false;
+                Main.LogAlways("Could not restore turnout ballast support; releasing the saved shoe.");
+            }
+            if (!restoreDroppedSupport) EndRestoreHold();
+            nextRestoreAttempt = Time.time + RestoreRetryInterval;
+        }
+
         /// <summary>
         /// Drops everything remembered about the wheel currently on the shoe,
         /// including which way the wedge was being driven, so the next wheel
@@ -3582,6 +3923,7 @@ namespace RailwayBrakeShoe
         private void ClearEngagement()
         {
             ReleaseStaticHold();
+            wheelSampleBogie = null;
             contactBogie = null;
             contactCar = null;
             hasCapturedOffset = false;
@@ -3603,7 +3945,6 @@ namespace RailwayBrakeShoe
             wheelTouching = false;
             ResetHazardTimer();
             jammedRolledBogie = null;
-            frogJamRolled = false;
             // v1.2.0: Reset high-speed flag so the next wheel gets its own roll.
             highSpeedRolled = false;
             lastBogieSpeed = 0f;
@@ -3681,7 +4022,8 @@ namespace RailwayBrakeShoe
         /// </summary>
         private bool TryFindEngagedAxle(out Bogie bogie, out double axleSpan, out float direction)
         {
-            return TryFindEngagedAxle(null, out bogie, out axleSpan, out direction);
+            if (IsPermanentFrogJam && TryFindCrossingAxle(out bogie, out axleSpan, out direction)) return true;
+            return TryFindEngagedAxle(IsServiceShoe ? ServiceCar : null, out bogie, out axleSpan, out direction);
         }
 
         /// <summary>
@@ -3697,6 +4039,8 @@ namespace RailwayBrakeShoe
 
         private bool TryFindEngagedAxle(TrainCar requiredCar, double searchRadius, out Bogie bogie, out double axleSpan, out float direction)
         {
+            if (IsServiceShoe && requiredCar != null)
+                return TryFindServiceAxle(requiredCar, searchRadius, out bogie, out axleSpan, out direction);
             bogie = null;
             axleSpan = 0.0;
             direction = 1f;
@@ -3872,7 +4216,11 @@ namespace RailwayBrakeShoe
                 return;
 
             Vector3 right = Vector3.Cross(up, forward).normalized;
-            Vector3 position = RailPlacement.GetRailheadPosition(currentTrack, center, right, up, railSide);
+            Vector3 position;
+            if (jammedAtInternalFrog)
+                position = RailPlacement.GetRailheadPosition(currentTrack, center, right, up, railSide);
+            else
+                RailPlacement.GetRailheadPose(currentTrack, center, forward, up, railSide, out position, out forward);
             Quaternion rotation = Quaternion.LookRotation(forward * (isReversed ? -1f : 1f), up);
 
             if (!IsFinite(position)) return;
@@ -3888,8 +4236,20 @@ namespace RailwayBrakeShoe
                 // Kinematic sweep, the same way the game moves its own bogies.
                 // Keeps the shoe swept rather than teleported, so contacts with
                 // non-kinematic bodies still resolve.
-                body.MovePosition(position);
-                body.MoveRotation(rotation);
+                // Re-submitting an unchanged kinematic target can keep the
+                // contact/joint island awake. Actual rail/turntable/Origin Shift
+                // changes still use the same swept movement and interpolation.
+                // Shoe-to-shoe pushes can submit more than one target before
+                // simulation. A target returning to the current body pose must
+                // still cancel the earlier queued movement in that same step.
+                bool queuedThisStep = railPoseQueueTime == Time.fixedTime;
+                if (body.position != position || (queuedThisStep && railPoseQueuePosition != position))
+                    body.MovePosition(position);
+                if (body.rotation != rotation || (queuedThisStep && railPoseQueueRotation != rotation))
+                    body.MoveRotation(rotation);
+                railPoseQueueTime = Time.fixedTime;
+                railPoseQueuePosition = position;
+                railPoseQueueRotation = rotation;
             }
             else
             {
@@ -3918,6 +4278,8 @@ namespace RailwayBrakeShoe
         /// </summary>
         private void EnsureItemControl()
         {
+            // Internal service clones never have item/inventory controls.
+            if (IsServiceShoe) return;
             if (item == null) item = GetComponent<DV.CabControls.ItemBase>();
             if (item == null || eventsHooked) return;
             item.Grabbed += OnItemGrabbed;
@@ -3952,6 +4314,7 @@ namespace RailwayBrakeShoe
         /// </summary>
         private void UpdatePickupBlock()
         {
+            if (IsServiceShoe) return;
             bool block = IsUnderRollingWheel;
             if (block == pickupBlocked) return;
 
@@ -4027,6 +4390,7 @@ namespace RailwayBrakeShoe
             // anchor that was just established and drop the shoe through the
             // rail.
             if (IsInPlacementGrace()) return;
+            if (restoreDroppedSupport || !string.IsNullOrEmpty(droppedSupportPath)) CancelRestore();
             if (snappedToRail || currentTrack != null)
             {
                 DetachFromRail("grabbed by the player");
@@ -4060,6 +4424,7 @@ namespace RailwayBrakeShoe
                 actionType == DV.InventorySystem.InventoryActionType.Destroy;
             if (!storedAway) return;
             if (IsInPlacementGrace()) return;
+            if (restoreDroppedSupport || !string.IsNullOrEmpty(droppedSupportPath)) CancelRestore();
             if (snappedToRail || currentTrack != null)
                 DetachFromRail("inventory action " + actionType);
         }
@@ -4084,34 +4449,6 @@ namespace RailwayBrakeShoe
             return placementGraceUntil > 0f && Time.time <= placementGraceUntil;
         }
 
-        /// <summary>
-        /// v1.2.0: Finds another brake shoe ahead of this one on the same track,
-        /// in the direction of travel. Used for shoe-to-shoe collision detection.
-        /// </summary>
-        private BrakeShoeBehaviour FindBlockingShoe(double proposedSpan, double travelDirection)
-        {
-            if (currentTrack == null || travelDirection == 0.0) return null;
-
-            // Search window: a few metres ahead in the direction of travel.
-            double searchDistance = 2.0; // metres
-            double searchSpan = proposedSpan + (searchDistance * travelDirection);
-
-            foreach (BrakeShoeBehaviour other in Main.Shoes)
-            {
-                if (other == null || other == this) continue;
-                if (!other.IsAnchored || other.currentTrack != currentTrack) continue;
-
-                // Check if the other shoe is ahead of us in the direction of travel.
-                double delta = (other.railSpan - proposedSpan) * travelDirection;
-                if (delta > 0 && delta < searchDistance)
-                {
-                    return other;
-                }
-            }
-
-            return null;
-        }
-
         private static int CountActiveShoes(TrainCar car)
         {
             if (activeShoeCountFrame != Time.frameCount)
@@ -4123,7 +4460,7 @@ namespace RailwayBrakeShoe
                     // offsetLocked, not hasCapturedOffset: a shoe lying the wrong
                     // way round is in contact but produces no resistance, so
                     // counting it would water down the shoes that do.
-                    if (shoe == null || !shoe.offsetLocked || shoe.contactCar == null) continue;
+                    if (shoe == null || shoe.IsServiceShoe || !shoe.offsetLocked || shoe.contactCar == null) continue;
                     int count;
                     ActiveShoeCounts.TryGetValue(shoe.contactCar, out count);
                     ActiveShoeCounts[shoe.contactCar] = count + 1;
@@ -4145,7 +4482,6 @@ namespace RailwayBrakeShoe
         private sealed class RailSnapCache
         {
             internal RailTrack Track;
-            internal readonly RailTrack[] SingleTrack = new RailTrack[1];
             internal Vector3 Source;
             internal Vector3 Position;
             internal Vector3 Forward;
@@ -4155,8 +4491,15 @@ namespace RailwayBrakeShoe
             // every placement frame.
             internal double Span;
             internal float Side;
+            // The player's requested facing is global to the placement action.
+            // EffectiveReversed is that request expressed in this track's own
+            // span basis, which can invert at a native joint.
+            internal bool RequestedReversed = false;
+            internal bool EffectiveReversed = false;
             internal bool HasSample;
             internal bool Valid;
+            internal int Frame;
+            internal float FixedTime;
         }
 
         // The distance an aim point may drift before the cached sample above is
@@ -4179,19 +4522,28 @@ namespace RailwayBrakeShoe
                     Caches.Add(cacheId, cache);
                 }
 
-                if (cache.HasSample && cache.Track == aimedTrack && (cache.Source - source).sqrMagnitude <= SampleToleranceSqr)
+                if (cache.HasSample && cache.Frame == Time.frameCount && cache.FixedTime == Time.fixedTime &&
+                    cache.Track == aimedTrack && (cache.Source - source).sqrMagnitude <= SampleToleranceSqr)
                 {
                     if (!cache.Valid) return false;
+                    cache.EffectiveReversed ^= cache.RequestedReversed != reversed;
+                    cache.RequestedReversed = reversed;
                     position = cache.Position;
-                    rotation = Quaternion.LookRotation(cache.Forward * (reversed ? -1f : 1f), cache.Up);
+                    rotation = Quaternion.LookRotation(cache.Forward * (cache.EffectiveReversed ? -1f : 1f), cache.Up);
                     return true;
                 }
 
+                RailTrack previousTrack = cache.Valid ? cache.Track : null;
+                Vector3 previousForward = cache.Forward;
+                bool previousRequestedReversed = cache.RequestedReversed;
+                bool previousEffectiveReversed = cache.EffectiveReversed;
+
                 cache.Source = source;
+                cache.Frame = Time.frameCount;
+                cache.FixedTime = Time.fixedTime;
                 cache.HasSample = true;
                 cache.Valid = false;
                 cache.Track = aimedTrack;
-                cache.SingleTrack[0] = aimedTrack;
 
                 // Resolve the aim point to a span, then sample the pose from that
                 // span with exactly the same call the placed shoe uses each
@@ -4202,6 +4554,15 @@ namespace RailwayBrakeShoe
                 Vector3 center, forward, up;
                 if (!TryGetPoseAtSpan(aimedTrack, span, out center, out forward, out up)) return false;
 
+                // Facing belongs to the placement action, not to a track's
+                // arbitrary span order. Carry it into the new tangent basis,
+                // including neighbouring/sibling tracks found by the aim query.
+                // On the same track keep that basis and honour a scroll toggle.
+                bool effectiveReversed = reversed;
+                if (previousTrack != null)
+                    effectiveReversed = previousEffectiveReversed ^ (previousRequestedReversed != reversed) ^
+                        (previousTrack != aimedTrack && Vector3.Dot(previousForward, forward) < 0f);
+
                 Vector3 right = Vector3.Cross(up, forward).normalized;
 
                 // Which of the two rails the player aimed at, from the lateral
@@ -4210,7 +4571,7 @@ namespace RailwayBrakeShoe
                 float lateral = Vector3.Dot(relative, right);
                 float side = lateral >= 0f ? 1f : -1f;
 
-                position = GetRailheadPosition(aimedTrack, center, right, up, side);
+                GetRailheadPose(aimedTrack, center, forward, up, side, out position, out forward);
 
                 cache.Valid = IsFinite(position) && IsFinite(forward) && IsFinite(up);
                 if (!cache.Valid) return false;
@@ -4219,7 +4580,9 @@ namespace RailwayBrakeShoe
                 cache.Position = position;
                 cache.Forward = forward;
                 cache.Up = up;
-                rotation = Quaternion.LookRotation(forward * (reversed ? -1f : 1f), up);
+                cache.RequestedReversed = reversed;
+                cache.EffectiveReversed = effectiveReversed;
+                rotation = Quaternion.LookRotation(forward * (effectiveReversed ? -1f : 1f), up);
                 return true;
             }
             catch (Exception ex)
@@ -4232,6 +4595,12 @@ namespace RailwayBrakeShoe
         internal static void ClearCache(int cacheId)
         {
             Caches.Remove(cacheId);
+        }
+
+        internal static void ClearWorldCaches()
+        {
+            Caches.Clear();
+            RailGeometryCache.Clear();
         }
 
         /// <summary>
@@ -4248,11 +4617,30 @@ namespace RailwayBrakeShoe
             RailSnapCache cache;
             if (!Caches.TryGetValue(cacheId, out cache)) return false;
             if (!cache.HasSample || !cache.Valid) return false;
+            if (cache.Frame != Time.frameCount || cache.FixedTime != Time.fixedTime) return false;
             if (cache.Track != aimedTrack) return false;
             if ((cache.Source - source).sqrMagnitude > SampleToleranceSqr) return false;
             span = cache.Span;
             side = cache.Side;
             return true;
+        }
+
+        internal static bool TryGetCachedFacing(int cacheId, RailTrack aimedTrack, Vector3 source, out bool reversed)
+        {
+            reversed = false;
+            RailSnapCache cache;
+            if (!TryGetCache(cacheId, aimedTrack, source, out cache)) return false;
+            reversed = cache.EffectiveReversed;
+            return true;
+        }
+
+        private static bool TryGetCache(int cacheId, RailTrack aimedTrack, Vector3 source, out RailSnapCache cache)
+        {
+            cache = null;
+            if (aimedTrack == null || !Caches.TryGetValue(cacheId, out cache)) return false;
+            return cache.HasSample && cache.Valid && cache.Frame == Time.frameCount &&
+                cache.FixedTime == Time.fixedTime && cache.Track == aimedTrack &&
+                (cache.Source - source).sqrMagnitude <= SampleToleranceSqr;
         }
 
         // ICollection, not an array: RailTrack.GetClosest takes ICollection
@@ -4544,11 +4932,14 @@ namespace RailwayBrakeShoe
                 Vector3d worldPosition = traveller.worldPosition;
                 position = new Vector3((float)worldPosition.x, (float)worldPosition.y, (float)worldPosition.z) + GetCurrentMove();
                 up = traveller.worldUp.normalized;
-                forward = Vector3.ProjectOnPlane(traveller.worldForward, up).normalized;
+                // Native Bogie and MeshSweeperJob keep the tangent, then make
+                // up orthogonal. Projecting onto worldUp flattens real grades.
+                forward = traveller.worldForward.normalized;
                 if (forward.sqrMagnitude < 0.5f || up.sqrMagnitude < 0.5f) return false;
 
                 // Re-orthogonalise so the basis stays clean through kinks.
                 Vector3 right = Vector3.Cross(up, forward).normalized;
+                if (right.sqrMagnitude < 0.5f) return false;
                 up = Vector3.Cross(forward, right).normalized;
                 return IsFinite(position) && IsFinite(forward) && IsFinite(up);
             }
@@ -4562,24 +4953,23 @@ namespace RailwayBrakeShoe
         // One traveller per point set. A single shared traveller would be
         // rebuilt on every call once two shoes sit on different tracks, since
         // each would evict the other's point set.
-        private static readonly Dictionary<DV.PointSet.EquiPointSet, DV.PointSet.PointSetTraveller> PoseTravellers =
-            new Dictionary<DV.PointSet.EquiPointSet, DV.PointSet.PointSetTraveller>();
+        private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<DV.PointSet.EquiPointSet, DV.PointSet.PointSetTraveller> PoseTravellers =
+            new System.Runtime.CompilerServices.ConditionalWeakTable<DV.PointSet.EquiPointSet, DV.PointSet.PointSetTraveller>();
 
         private static DV.PointSet.PointSetTraveller GetPoseTraveller(DV.PointSet.EquiPointSet pointSet)
         {
             DV.PointSet.PointSetTraveller existing;
             if (PoseTravellers.TryGetValue(pointSet, out existing) && existing != null) return existing;
 
-            // Bounded: shoes only ever occupy a handful of tracks, but a save
-            // reload replaces point sets, so do not let stale keys accumulate.
-            if (PoseTravellers.Count > 32) PoseTravellers.Clear();
+            // Weak keys retire old worlds together with their pointsets. A hard
+            // clear at 33 entries rebuilt travellers continuously in large yards.
 
             // preciseInterpolation: false matches Bogie.SetTrack. With true,
             // UpdateWorldPosition switches to Catmul-Rom instead of the linear
             // lerp the bogies use, so the shoe and the wheel would resolve a
             // shared span to slightly different places through curves.
             DV.PointSet.PointSetTraveller created = new DV.PointSet.PointSetTraveller(pointSet, false);
-            PoseTravellers[pointSet] = created;
+            PoseTravellers.Add(pointSet, created);
             return created;
         }
 
@@ -4713,6 +5103,63 @@ namespace RailwayBrakeShoe
             float height;
             TryGetRailGeometry(track, out lateral, out height);
             return center + right * side * lateral + up * height;
+        }
+
+        internal static void GetRailheadPose(RailTrack track, Vector3 center, Vector3 forward, Vector3 up, float side,
+            out Vector3 position, out Vector3 tangent)
+        {
+            Vector3 nominal = GetRailheadPosition(track, center, Vector3.Cross(up, forward).normalized, up, side);
+            position = nominal; tangent = forward;
+            Vector3 measured, measuredTangent;
+            if (TurnoutRailSurface.TryGet(track, nominal, forward, up, out measured, out measuredTangent))
+            {
+                position = measured;
+                tangent = measuredTangent;
+            }
+        }
+
+        internal static bool TryGetClosestRail(Vector3 aim, IList<RailTrack> tracks, out RailTrack track, out Vector3 point)
+        {
+            track = null;
+            point = aim;
+            float best = Settings.RailSnapDistance * Settings.RailSnapDistance;
+            for (int i = 0; i < tracks.Count; i++)
+            {
+                RailTrack candidate = tracks[i];
+                double span;
+                Vector3 center, forward, up;
+                if (!TryGetSpanAt(candidate, aim, out span) ||
+                    !TryGetPoseAtSpan(candidate, span, out center, out forward, out up)) continue;
+                float vertical = Vector3.Dot(aim - center, up);
+                if (vertical > 0.6f || vertical < -0.8f) continue;
+                Vector3 right = Vector3.Cross(up, forward).normalized;
+                float side = Vector3.Dot(aim - center, right) >= 0f ? 1f : -1f;
+                Vector3 rail, railTangent;
+                GetRailheadPose(candidate, center, forward, up, side, out rail, out railTangent);
+                Vector3 delta = aim - rail;
+                // The ray hits ballast; compare the rail in its own plane.
+                // Include longitudinal error to reject aims beyond a track end.
+                float across = Vector3.Dot(delta, right), along = Vector3.Dot(delta, forward);
+                float score = across * across + along * along;
+                if (score > best) continue;
+                // Coincident routes share a physical rail at the entry joint.
+                // Prefer the native selected route only for an actual tie.
+                if (track != null && best - score < 0.000001f && IsSelectedBranch(track) &&
+                    !IsSelectedBranch(candidate)) continue;
+                best = score;
+                track = candidate;
+                point = aim - up * vertical;
+            }
+            return track != null;
+        }
+
+        private static bool IsSelectedBranch(RailTrack track)
+        {
+            Junction junction = track.inJunction;
+            if (junction == null || junction.outBranches == null ||
+                junction.selectedBranch >= junction.outBranches.Count) return false;
+            Junction.Branch branch = junction.outBranches[junction.selectedBranch];
+            return branch != null && branch.track == track;
         }
 
         /// <summary>
@@ -4894,7 +5341,6 @@ namespace RailwayBrakeShoe
         private static readonly FieldInfo MaxDistanceField = AccessTools.Field(typeof(ItemPlacerNonVr), "maxDistance");
         private static readonly FieldInfo ContainerField = AccessTools.Field(typeof(ItemPlacerNonVr), "container");
         private static readonly MethodInfo UpdateAccessPointMethod = AccessTools.Method(typeof(ItemPlacerNonVr), "UpdateAccessPoint");
-        private static readonly FieldInfo WorldOverlapMaskField = AccessTools.Field(typeof(ItemPlacerNonVr), "worldOverlapMask");
         // HelperData carries two sibling transforms, both parented to the player
         // camera in InitializePreview: boundsTransform is the invisible bounding
         // box, previewTransform is the model the player actually sees. Vanilla
@@ -4905,7 +5351,6 @@ namespace RailwayBrakeShoe
         private static readonly FieldInfo BoundsTransformField = AccessTools.Field(HelperField.FieldType, "boundsTransform");
         private static readonly FieldInfo PreviewTransformField = AccessTools.Field(HelperField.FieldType, "previewTransform");
         private static readonly MethodInfo ToggleColorMethod = AccessTools.Method(HelperField.FieldType, "ToggleColor");
-        private static readonly RaycastHit[] RailRayHits = new RaycastHit[64];
         private static readonly Dictionary<int, bool> ReversedByPlacer = new Dictionary<int, bool>();
 
         /// <summary>
@@ -4927,6 +5372,7 @@ namespace RailwayBrakeShoe
             internal float Side;
             internal double Span;
             internal bool SpanKnown;
+            internal bool Reversed;
         }
 
         private static readonly Dictionary<int, ResolvedAnchor> AnchorByPlacer = new Dictionary<int, ResolvedAnchor>();
@@ -4979,6 +5425,23 @@ namespace RailwayBrakeShoe
         }
 
         private static readonly Dictionary<int, TrackBounds> TrackBoundsCache = new Dictionary<int, TrackBounds>();
+
+        internal static void ClearWorldCaches()
+        {
+            cachedAllTracks = null;
+            lastTrackCacheFrame = -1;
+            NearbyTracks.Clear();
+            nearbyTracksValid = false;
+            nearbyTracksSourceCount = -1;
+            nearbyTracksReach = -1f;
+            TrackBoundsCache.Clear();
+            ReversedByPlacer.Clear();
+            AnchorByPlacer.Clear();
+            LastToggleFrame.Clear();
+            ScrollWasActive.Clear();
+            LastValidity.Clear();
+            AppliedValidity.Clear();
+        }
 
         /// <summary>
         /// Conservative bounding sphere for a track, from its Bezier control
@@ -5309,6 +5772,19 @@ namespace RailwayBrakeShoe
             if (aimedTrack == null) return;
             ResolvedAnchor anchor = new ResolvedAnchor();
             anchor.Track = aimedTrack;
+            bool facing;
+            if (RailPlacement.TryGetCachedFacing(placer.GetInstanceID(), aimedTrack, aimedPoint, out facing))
+                anchor.Reversed = facing;
+            else
+                ReversedByPlacer.TryGetValue(placer.GetInstanceID(), out anchor.Reversed);
+            // Commit the exact span and side ResolvePlacement just validated.
+            if (RailPlacement.TryGetCachedSpanAndSide(placer.GetInstanceID(), aimedTrack,
+                aimedPoint, out anchor.Span, out anchor.Side))
+            {
+                anchor.SpanKnown = true;
+                AnchorByPlacer[placer.GetInstanceID()] = anchor;
+                return;
+            }
             anchor.Side = 1f;
             try
             {
@@ -5319,7 +5795,7 @@ namespace RailwayBrakeShoe
                 {
                     Vector3 up = new Vector3((float)point.up.x, (float)point.up.y, (float)point.up.z).normalized;
                     Vector3 rawForward = new Vector3((float)point.forward.x, (float)point.forward.y, (float)point.forward.z);
-                    Vector3 forward = Vector3.ProjectOnPlane(rawForward, up).normalized;
+                    Vector3 forward = rawForward.normalized;
                     Vector3 right = Vector3.Cross(up, forward).normalized;
 
                     Vector3 shiftedPoint = new Vector3((float)point.position.x, (float)point.position.y, (float)point.position.z);
@@ -5357,8 +5833,6 @@ namespace RailwayBrakeShoe
             }
 
             int id = __instance.GetInstanceID();
-            bool reversed;
-            ReversedByPlacer.TryGetValue(id, out reversed);
             ResolvedAnchor anchor;
             bool haveAnchor = AnchorByPlacer.TryGetValue(id, out anchor) && anchor != null && anchor.Track != null;
 
@@ -5374,7 +5848,7 @@ namespace RailwayBrakeShoe
             }
 
             shoe.MarkPlaced();
-            shoe.AttachToRail(anchor.Track, reversed, anchor.Side, anchor.Span, anchor.SpanKnown);
+            shoe.AttachToRail(anchor.Track, anchor.Reversed, anchor.Side, anchor.Span, anchor.SpanKnown);
             // The shoe now belongs to the rail, so the placer must stop
             // treating it as the held item.
             ItemField.SetValue(__instance, null);
@@ -5684,7 +6158,7 @@ namespace RailwayBrakeShoe
 
                 Vector3 up = new Vector3((float)point.up.x, (float)point.up.y, (float)point.up.z).normalized;
                 Vector3 rawForward = new Vector3((float)point.forward.x, (float)point.forward.y, (float)point.forward.z);
-                Vector3 forward = Vector3.ProjectOnPlane(rawForward, up).normalized;
+                Vector3 forward = rawForward.normalized;
                 Vector3 right = Vector3.Cross(up, forward).normalized;
                 Vector3 center = new Vector3((float)point.position.x, (float)point.position.y, (float)point.position.z) + RailPlacement.GetCurrentMoveStatic();
                 return Vector3.Dot(source - center, right) >= 0f ? 1f : -1f;
@@ -5742,61 +6216,11 @@ namespace RailwayBrakeShoe
 
             try
             {
-                // RailTrack.GetClosest applies the origin shift itself, but it
-                // walks every point of every track it is handed, so it gets a
-                // shortlist rather than the whole registry.
-                RailTrack closestTrack;
-                DV.PointSet.EquiPointSet.Point closestPoint;
-                List<RailTrack> nearby = GetNearbyTracks(aimPoint, cachedAllTracks);
-                if (!RailPlacement.TryGetClosestPoint(aimPoint, nearby, out closestTrack, out closestPoint)) return false;
-
-                Vector3 shifted = new Vector3((float)closestPoint.position.x, (float)closestPoint.position.y, (float)closestPoint.position.z);
-                Vector3 centre = shifted + RailPlacement.GetCurrentMoveStatic();
-                Vector3 up = new Vector3(closestPoint.up.x, closestPoint.up.y, closestPoint.up.z).normalized;
-                Vector3 forward = Vector3.ProjectOnPlane(new Vector3(closestPoint.forward.x, closestPoint.forward.y, closestPoint.forward.z), up).normalized;
-                if (up.sqrMagnitude < 0.5f || forward.sqrMagnitude < 0.5f) return false;
-                Vector3 right = Vector3.Cross(up, forward).normalized;
-
-                // The ray cannot hit the rail itself - RailTracks have no
-                // colliders - so it lands on the ballast/terrain below the
-                // railhead. A single 3-D distance test would therefore mix the
-                // vertical drop in with the lateral offset and reject valid aims.
-                // Decompose in the track's own basis instead and allow a generous
-                // vertical band, the way the game's own placement helpers offset
-                // track points by point.up before measuring.
-                Vector3 relative = aimPoint - centre;
-                float lateral = Mathf.Abs(Vector3.Dot(relative, right));
-                float vertical = Vector3.Dot(relative, up);
-
-                // Same per-track rail geometry the shoe is actually placed
-                // against, not the fallback constant, so what the test accepts
-                // and where the shoe lands cannot disagree.
-                float railLateral;
-                float railHeight;
-                RailPlacement.TryGetRailGeometry(closestTrack, out railLateral, out railHeight);
-
-                // Distance to the NEARER RAIL, not to the centreline. Comparing
-                // against the centreline accepted the whole sleeper bed plus the
-                // snap distance on top, so the preview went valid while the
-                // player was pointing at ballast a couple of metres away from
-                // any rail. lateral is already an absolute value, so subtracting
-                // the rail offset gives the offset from whichever rail is closer.
-                float railDistance = Mathf.Abs(lateral - railLateral);
-                if (railDistance > Settings.RailSnapDistance) return false;
-
-                // Vertical band. The ray cannot hit the rail, so it lands on the
-                // sleepers or ballast a little below the point set, and the
-                // player may be looking slightly down onto the railhead from
-                // above. Keep this tight enough that aiming at an embankment
-                // well below the track no longer counts as aiming at the rail.
-                if (vertical > 0.6f || vertical < -0.8f) return false;
-
-                // Fold the aim point onto the railhead plane so the caller's
-                // lateral test (which picks left vs right rail) sees only the
-                // sideways component and not the drop to the terrain.
-                track = closestTrack;
-                point = aimPoint - up * vertical;
-                return true;
+                // Choose the nearest physical rail among all shortlisted tracks.
+                // Picking a centreline first chooses the wrong branch where the
+                // two turnout centrelines are closer than their rail spacing.
+                return RailPlacement.TryGetClosestRail(aimPoint,
+                    GetNearbyTracks(aimPoint, cachedAllTracks), out track, out point);
             }
             catch (Exception ex)
             {
@@ -5856,40 +6280,68 @@ namespace RailwayBrakeShoe
 
     internal static class WeatherCompatibility
     {
-        private static Component driver;
-        private static float nextLookup;
+        private static DV.WeatherSystem.WeatherDriver driver;
+        private static float sampleTime = float.NegativeInfinity;
+        private static float wetness;
 
         internal static float GetWetness()
         {
-            try
+            // Native WeatherDriver is a scene singleton and explicitly forbids
+            // auto-creation. Reading Instance neither scans nor creates objects.
+            // A replacement world must not inherit the previous wetness sample.
+            DV.WeatherSystem.WeatherDriver current = DV.WeatherSystem.WeatherDriver.Instance;
+            if (current == null)
             {
-                if (driver == null && Time.unscaledTime >= nextLookup)
-                {
-                    nextLookup = Time.unscaledTime + 10f;
-                    Type type = AccessTools.TypeByName("DV.WeatherSystem.WeatherDriver");
-                    if (type != null) driver = UnityEngine.Object.FindObjectOfType(type) as Component;
-                }
-                if (driver == null) return 0f;
-                object value = AccessTools.Property(driver.GetType(), "WetnessValue").GetValue(driver, null);
-                if (value == null) return 0f;
-                object current = AccessTools.Property(value.GetType(), "CurrentValue").GetValue(value, null);
-                return Mathf.Clamp01(Convert.ToSingle(current));
+                driver = null;
+                sampleTime = float.NegativeInfinity;
+                return 0f;
             }
-            catch { return 0f; }
+            if (driver != current) { driver = current; sampleTime = float.NegativeInfinity; }
+            if (sampleTime == Time.fixedTime) return wetness;
+            DV.OverridableValue<float> value = driver.WetnessValue;
+            if (value == null) return 0f; // scene singleton not initialized yet
+            wetness = Mathf.Clamp01(value.CurrentValue);
+            sampleTime = Time.fixedTime;
+            return wetness;
         }
     }
 
     internal static class HandbrakePatch
     {
-        internal static void Postfix(object __instance)
+        internal static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
         {
-            if (!Main.Config.ReduceHandbrake || __instance == null) return;
-            Type type = __instance.GetType();
-            FieldInfo handbrake = AccessTools.Field(type, "handbrakePosition");
-            FieldInfo braking = AccessTools.Field(type, "brakingFactor");
-            if (handbrake == null || braking == null || Convert.ToSingle(handbrake.GetValue(__instance)) <= 0f) return;
-            float value = Convert.ToSingle(braking.GetValue(__instance));
-            braking.SetValue(__instance, Mathf.Clamp01(value * Main.Config.HandbrakeMultiplier));
+            FieldInfo handbrake = AccessTools.Field(typeof(DV.Simulation.Brake.BrakeSystem), "handbrakePosition");
+            MethodInfo scale = AccessTools.Method(typeof(HandbrakePatch), "ScaleHandbrake");
+            MethodInfo maximum = AccessTools.Method(typeof(Mathf), "Max", new[] { typeof(float), typeof(float) });
+            List<CodeInstruction> result = new List<CodeInstruction>();
+            int reads = 0, count = 0;
+            foreach (CodeInstruction instruction in instructions)
+            {
+                if (instruction.opcode == System.Reflection.Emit.OpCodes.Ldfld && Equals(instruction.operand, handbrake))
+                    reads++;
+                if (instruction.opcode == System.Reflection.Emit.OpCodes.Call && Equals(instruction.operand, maximum))
+                {
+                    if (reads != 1) throw new InvalidOperationException("Native brake input order changed");
+                    // Keep the native anyHandbrakeApplied flag based on the real
+                    // handle position, even with a zero efficiency multiplier.
+                    CodeInstruction scaled = new CodeInstruction(System.Reflection.Emit.OpCodes.Call, scale);
+                    scaled.labels.AddRange(instruction.labels);
+                    instruction.labels.Clear();
+                    result.Add(scaled);
+                    count++;
+                }
+                result.Add(instruction);
+            }
+            if (reads != 1 || count != 1) throw new InvalidOperationException("Native handbrake input changed: " + reads + "/" + count);
+            return result;
+        }
+
+        internal static float ScaleHandbrake(float position)
+        {
+            // Native max(air, hand), heat, SmoothDamp and notifications run once.
+            // Never scale their already-smoothed total output.
+            return Main.Config != null && Main.Config.ReduceHandbrake
+                ? position * Mathf.Clamp01(Main.Config.HandbrakeMultiplier) : position;
         }
     }
 
@@ -5940,7 +6392,13 @@ namespace RailwayBrakeShoe
                         mesh.triangles = triangles;
                         if (normals != null && normals.Length == vertices.Length) mesh.normals = normals;
                         else mesh.RecalculateNormals();
-                        if (uv != null && uv.Length == vertices.Length) mesh.uv = uv;
+                        if (uv != null && uv.Length == vertices.Length)
+                        {
+                            mesh.uv = uv;
+                            // Build the normal-map basis from the final mirrored
+                            // vertices and flipped UVs, once on the shared mesh.
+                            mesh.RecalculateTangents();
+                        }
                         mesh.RecalculateBounds();
 
                         GameObject part = new GameObject(mesh.name);
@@ -6077,7 +6535,111 @@ namespace RailwayBrakeShoe
             {
                 Main.Log("Embedded GLB texture skipped: " + ex.Message);
             }
+            if (materials != null && index >= 0 && index < materials.Count)
+            {
+                JToken pbr = materials[index]["pbrMetallicRoughness"];
+                Texture2D packed = null;
+                try
+                {
+                    packed = LoadLinearTexture(json, binary, pbr == null ? null : pbr["metallicRoughnessTexture"]);
+                    if (packed != null)
+                    {
+                        Color32[] pixels = packed.GetPixels32();
+                        for (int i = 0; i < pixels.Length; i++)
+                            pixels[i] = PackMetallicRoughness(pixels[i], metallic, roughness);
+                        packed.SetPixels32(pixels);
+                        packed.Apply(true, true);
+                        packed.name = "RailwayBrakeShoe_MetallicSmoothness";
+                        material.SetTexture("_MetallicGlossMap", packed);
+                        material.SetFloat("_GlossMapScale", 1f);
+                        material.EnableKeyword("_METALLICGLOSSMAP");
+                        packed = null; // Material owns the shared texture.
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Main.LogAlways("Embedded GLB metallic/roughness map skipped: " + ex.Message);
+                }
+                finally
+                {
+                    if (packed != null) UnityEngine.Object.Destroy(packed);
+                }
+
+                JToken normalInfo = materials[index]["normalTexture"];
+                Texture2D normal = null;
+                try
+                {
+                    normal = LoadLinearTexture(json, binary, normalInfo);
+                    if (normal != null)
+                    {
+                        Color32[] pixels = normal.GetPixels32();
+                        for (int i = 0; i < pixels.Length; i++) pixels[i] = PackNormal(pixels[i]);
+                        normal.SetPixels32(pixels);
+                        normal.Apply(true, true);
+                        normal.name = "RailwayBrakeShoe_Normal";
+                        material.SetTexture("_BumpMap", normal);
+                        material.SetFloat("_BumpScale", normalInfo["scale"] == null ? 1f : (float)normalInfo["scale"]);
+                        material.EnableKeyword("_NORMALMAP");
+                        normal = null;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Main.LogAlways("Embedded GLB normal map skipped: " + ex.Message);
+                }
+                finally
+                {
+                    if (normal != null) UnityEngine.Object.Destroy(normal);
+                }
+            }
             return material;
+        }
+
+        private static Color32 PackMetallicRoughness(Color32 source, float metallic, float roughness)
+        {
+            // glTF: G=roughness, B=metal. Unity Standard: R=metal,
+            // A=smoothness. Factors must be baked because Standard ignores
+            // the constant metallic slider when its texture keyword is set.
+            byte metal = (byte)Math.Round(Math.Max(0f, Math.Min(255f, source.b * metallic)));
+            byte smooth = (byte)Math.Round(Math.Max(0f, Math.Min(255f, 255f - source.g * roughness)));
+            return new Color32(metal, 0, 0, smooth);
+        }
+
+        private static Color32 PackNormal(Color32 source)
+        {
+            // Runtime PNG loading does not perform Unity's normal-map import
+            // swizzle. Standard's desktop AG/RG unpack reads X from R*A, Y
+            // from G. UV.v is inverted in ReadVector2, so tangent-space Y
+            // must invert as well with the recalculated final tangent basis.
+            return new Color32(255, (byte)(255 - source.g), 255, source.r);
+        }
+
+        private static Texture2D LoadLinearTexture(JObject json, byte[] binary, JToken info)
+        {
+            if (info == null || info["index"] == null) return null;
+            JArray textures = json["textures"] as JArray;
+            JArray images = json["images"] as JArray;
+            int textureIndex = (int)info["index"];
+            int imageIndex = (int)textures[textureIndex]["source"];
+            JObject image = (JObject)images[imageIndex];
+            JObject view = (JObject)((JArray)json["bufferViews"])[(int)image["bufferView"]];
+            int start = view["byteOffset"] == null ? 0 : (int)view["byteOffset"];
+            int length = (int)view["byteLength"];
+            byte[] encoded = new byte[length];
+            Buffer.BlockCopy(binary, start, encoded, 0, length);
+            Texture2D texture = new Texture2D(2, 2, TextureFormat.RGBA32, true, true);
+            try
+            {
+                if (!texture.LoadImage(encoded, false)) throw new InvalidDataException("Invalid embedded material image.");
+                texture.wrapMode = TextureWrapMode.Repeat;
+                texture.anisoLevel = 4;
+                return texture;
+            }
+            catch
+            {
+                UnityEngine.Object.Destroy(texture);
+                throw;
+            }
         }
 
         private static Vector3[] ReadVector3(JObject json, byte[] binary, int accessorIndex)

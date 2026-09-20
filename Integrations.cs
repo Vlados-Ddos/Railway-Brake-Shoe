@@ -53,7 +53,8 @@ namespace RailwayBrakeShoe
         {
             try
             {
-                if (__instance == null || HandbrakePendingField == null ||
+                if (Main.Config == null || !Main.Config.BrakeShoeCountsAsHandbrake ||
+                    __instance == null || HandbrakePendingField == null ||
                     !(bool)HandbrakePendingField.GetValue(__instance)) return;
                 object cars = CarsField == null ? null : CarsField.GetValue(__instance);
                 System.Collections.IEnumerable list = cars as System.Collections.IEnumerable;
@@ -165,6 +166,14 @@ namespace RailwayBrakeShoe
 
         internal static void Track(BrakeShoeBehaviour shoe) { AllShoes.Add(shoe); }
         internal static void Untrack(BrakeShoeBehaviour shoe) { AllShoes.Remove(shoe); }
+
+        internal static void SetShoesEnabled(bool enabled)
+        {
+            // This existing registry includes disabled/container items and
+            // excludes service shoes. OnEnable/OnDisable do not modify it.
+            foreach (BrakeShoeBehaviour shoe in AllShoes)
+                if (shoe != null) shoe.enabled = enabled;
+        }
 
         internal static void Install(Harmony harmony)
         {
